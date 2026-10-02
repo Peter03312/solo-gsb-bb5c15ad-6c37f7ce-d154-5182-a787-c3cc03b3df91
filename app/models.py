@@ -41,3 +41,8 @@ HANDOVER_STATUS_LABELS_ZH = {
     HANDOVER_VALID: "有效",
     HANDOVER_INVALID: "失效",
 }
+
+# 仪器失准故障状态：active 为有效故障（时段参与遮蔽并集），
+# withdrawn 为馆员凭标识 + 非空原因撤回（留存撤回原因/时间，不再遮蔽）。
+FAULT_ACTIVE = "active"
+FAULT_WITHDRAWN = "withdrawn"

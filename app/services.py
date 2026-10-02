@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
 from .models import (
+    FAULT_ACTIVE,
+    FAULT_WITHDRAWN,
     HANDOVER_INVALID,
     HANDOVER_STATUS_LABELS_ZH,
     HANDOVER_VALID,
@@ -20,6 +23,8 @@ from .report import build_revision_report
 from .schemas import (
     CertificateRevokeSubmit,
     HandoverOrderSubmit,
+    InstrumentFaultSubmit,
+    InstrumentFaultWithdrawSubmit,
     ReadingBatchSubmit,
     ReadingSubmit,
     ReadingVoidSubmit,
@@ -664,13 +669,207 @@ def revision_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- 仪器失准故障
+
+def list_active_fault_rows(
+    conn: sqlite3.Connection, window_id: int
+) -> list[sqlite3.Row]:
+    """窗口当前有效（未撤回）故障时段，按起点、终点升序。"""
+    return conn.execute(
+        "SELECT * FROM instrument_faults WHERE window_id=? AND status=? "
+        "ORDER BY start_at ASC, end_at ASC",
+        (window_id, FAULT_ACTIVE),
+    ).fetchall()
+
+
+def _fault_row_or_404(
+    conn: sqlite3.Connection, window_id: int, fault_id: str
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM instrument_faults WHERE window_id=? AND fault_id=?",
+        (window_id, fault_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"故障标识 {fault_id} 在窗口 {window_id} 中不存在",
+        )
+    return row
+
+
+def _validate_fault_interval(
+    payload: InstrumentFaultSubmit,
+    win_start: datetime,
+    win_end: datetime,
+) -> tuple[str, str]:
+    """校验带时区、start 严格早于 end、半开区间完全落在窗口 [start, end) 内。
+
+    返回 (start_iso, end_iso)。窗口起点/终点处采用半开语义：允许故障恰从
+    窗口起点开始、恰在窗口终点结束（读数提交的窗口闭区间不影响故障判定）。
+    """
+    start = to_utc(payload.start_at)
+    end = to_utc(payload.end_at)
+    if start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"非法故障时段：start_at（{to_iso(start)}）必须严格早于 "
+                f"end_at（{to_iso(end)}），时段为半开 [start, end)。"
+            ),
+        )
+    if start < win_start or end > win_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"非法故障时段 [{to_iso(start)}, {to_iso(end)})：必须完全落在窗口 "
+                f"[{to_iso(win_start)}, {to_iso(win_end)}) 内（半开，两端不得越界）。"
+            ),
+        )
+    return to_iso(start), to_iso(end)
+
+
+def register_instrument_fault(
+    conn: sqlite3.Connection, window_id: int, payload: InstrumentFaultSubmit
+) -> tuple[str, dict[str, Any]]:
+    """登记仪器失准故障时段，返回 (effect, fault_dict)。调用方需已持有写事务。
+
+    - 窗口不存在 -> 404（先于时段校验，撤回语义不受窗口边界限制）；
+    - 缺时区（请求模型先拦截）、起点不早于终点、时段越出窗口 -> 422 且不改状态；
+    - 同标识 + 同时段同原因重放 -> ("idempotent", 原记录)；
+    - 同标识但时段或原因任一不同 -> 409；
+    - 已撤回标识不能再次登记 -> 409（撤回不可逆，新故障请使用新标识）。
+    """
+    win = get_window_row(conn, window_id)
+    win_start = parse_stored(win["start_at"])
+    win_end = parse_stored(win["end_at"])
+    start_iso, end_iso = _validate_fault_interval(payload, win_start, win_end)
+
+    existing = conn.execute(
+        "SELECT * FROM instrument_faults WHERE window_id=? AND fault_id=?",
+        (window_id, payload.fault_id),
+    ).fetchone()
+    if existing is not None:
+        if existing["status"] == FAULT_WITHDRAWN:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障标识 {payload.fault_id} 已于 {existing['withdrawn_at']} 撤回，"
+                    "撤回不可逆，不能以该标识再次登记；如需登记新故障请使用新标识。"
+                ),
+            )
+        same = (
+            existing["start_at"] == start_iso
+            and existing["end_at"] == end_iso
+            and existing["reason"] == payload.reason
+        )
+        if not same:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障标识 {payload.fault_id} 已登记但内容冲突："
+                    f"已存（{existing['start_at']}, {existing['end_at']}，"
+                    f"原因「{existing['reason']}」），本次（{start_iso}, {end_iso}，"
+                    f"原因「{payload.reason}」）。相同故障标识重放必须时段与原因完全一致。"
+                ),
+            )
+        return "idempotent", instrument_fault_to_dict(existing)
+
+    conn.execute(
+        """
+        INSERT INTO instrument_faults (window_id, fault_id, start_at, end_at, reason, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (window_id, payload.fault_id, start_iso, end_iso,
+         payload.reason, FAULT_ACTIVE),
+    )
+    row = conn.execute(
+        "SELECT * FROM instrument_faults WHERE window_id=? AND fault_id=?",
+        (window_id, payload.fault_id),
+    ).fetchone()
+    return "registered", instrument_fault_to_dict(row)
+
+
+def withdraw_instrument_fault(
+    conn: sqlite3.Connection, window_id: int, fault_id: str,
+    payload: InstrumentFaultWithdrawSubmit,
+) -> tuple[str, dict[str, Any]]:
+    """撤回仪器失准故障时段，返回 (effect, fault_dict)。调用方需已持有写事务。
+
+    - 未知标识 -> 404；空原因（请求模型先拦截）-> 422；
+    - 有效故障首次撤回 -> ("withdrawn", 记录)，留存撤回原因与时间；
+    - 同标识相同原因重复撤回 -> ("idempotent", 原撤回记录，撤回时间不变)；
+    - 已撤回故障以不同原因撤回 -> 409。
+    """
+    row = _fault_row_or_404(conn, window_id, fault_id)
+    if row["status"] == FAULT_WITHDRAWN:
+        if payload.reason != row["withdrawn_reason"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障 {fault_id} 已撤回且撤回原因冲突："
+                    f"已存「{row['withdrawn_reason']}」，本次「{payload.reason}」。"
+                    "重复撤回必须使用相同原因（相同原因重放为幂等，返回原记录）。"
+                ),
+            )
+        return "idempotent", instrument_fault_to_dict(row)
+
+    conn.execute(
+        "UPDATE instrument_faults SET status=?, withdrawn_reason=?, "
+        "withdrawn_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+        "WHERE window_id=? AND fault_id=?",
+        (FAULT_WITHDRAWN, payload.reason, window_id, fault_id),
+    )
+    row = conn.execute(
+        "SELECT * FROM instrument_faults WHERE window_id=? AND fault_id=?",
+        (window_id, fault_id),
+    ).fetchone()
+    return "withdrawn", instrument_fault_to_dict(row)
+
+
+def list_instrument_faults(
+    conn: sqlite3.Connection, window_id: int,
+    active_only: bool = False,
+) -> list[dict[str, Any]]:
+    """窗口全部故障记录（登记时间升序）；active_only=True 时只给有效故障。"""
+    if active_only:
+        rows = list_active_fault_rows(conn, window_id)
+    else:
+        rows = conn.execute(
+            "SELECT * FROM instrument_faults WHERE window_id=? "
+            "ORDER BY registered_at ASC, id ASC",
+            (window_id,),
+        ).fetchall()
+    return [instrument_fault_to_dict(r) for r in rows]
+
+
+def instrument_fault_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "fault_id": row["fault_id"],
+        "start_at": row["start_at"],
+        "end_at": row["end_at"],
+        "reason": row["reason"],
+        "status": row["status"],
+        "registered_at": row["registered_at"],
+        "withdrawn_reason": row["withdrawn_reason"],
+        "withdrawn_at": row["withdrawn_at"],
+    }
+
+
 # ---------------------------------------------------------------- 审定计算
 
 def compute_evaluation(conn: sqlite3.Connection, win: sqlite3.Row) -> dict[str, Any]:
-    """基于当前活动读数计算审定结果（不签发）。"""
+    """基于当前活动读数与有效仪器失准故障时段计算审定结果（不签发）。
+
+    有效故障时段取并集遮蔽时间线：遮蔽部分无论有无读数均为未知，
+    故障边界切断连续超限；未遮蔽部分沿用采样保持与间隔规则。
+    """
     reading_rows = list_active_readings(conn, win["id"])
     readings = [
         (parse_stored(r["measured_at"]), float(r["temperature"])) for r in reading_rows
+    ]
+    fault_rows = list_active_fault_rows(conn, win["id"])
+    faults = [
+        (parse_stored(r["start_at"]), parse_stored(r["end_at"])) for r in fault_rows
     ]
     return evaluate(
         window_start=parse_stored(win["start_at"]),
@@ -680,6 +879,7 @@ def compute_evaluation(conn: sqlite3.Connection, win: sqlite3.Row) -> dict[str, 
         max_exceed_seconds=float(win["max_continuous_exceed_seconds"]),
         max_sample_interval=float(win["max_sample_interval_seconds"]),
         readings=readings,
+        faults=faults,
     )
 
 
@@ -711,6 +911,9 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "current_certificate_id": current["id"] if current else None,
         "current_certificate_version": current["version"] if current else None,
         "current_verdict": current["verdict"] if current else None,
+        "active_instrument_faults": [
+            instrument_fault_to_dict(r) for r in list_active_fault_rows(conn, row["id"])
+        ],
     }
 
 
@@ -948,6 +1151,7 @@ def issue_certificate(
     win = get_window_row(conn, window_id)
     evaluation = compute_evaluation(conn, win)
     reading_rows = list_active_readings(conn, window_id)
+    fault_rows = list_active_fault_rows(conn, window_id)
 
     last = conn.execute(
         "SELECT MAX(version) AS v FROM certificates WHERE window_id=?", (window_id,)
@@ -968,6 +1172,9 @@ def issue_certificate(
         },
         "evaluation": evaluation,
         "readings": [reading_to_dict(r) for r in reading_rows],
+        # 新签证书固化签发时的有效仪器失准故障时段及据此重算的结果；
+        # 旧证书快照无此字段，报告还原时视为空（见 report._snapshot_faults）。
+        "instrument_faults": [instrument_fault_to_dict(r) for r in fault_rows],
     }
 
     cur = conn.execute(

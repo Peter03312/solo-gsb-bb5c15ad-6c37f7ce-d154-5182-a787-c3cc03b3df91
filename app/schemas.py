@@ -120,6 +120,88 @@ class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
 
+# ------------------------------------------------------------ 仪器失准故障
+
+class InstrumentFaultSubmit(BaseModel):
+    """馆员确认采样仪器失准：凭窗口内唯一故障标识 + 非空原因 + 带时区
+    起止时间登记故障时段（半开 [start_at, end_at)）。
+
+    - 时段必须完全落在审定窗口内（窗口对故障为半开 [start, end)：
+      start_at >= 窗口起点、end_at <= 窗口终点），且 start_at 严格早于
+      end_at，时间戳必须带时区，否则 422；原因为空或只含空白 -> 422；
+    - 同故障标识 + 同时段同原因重放 -> 幂等（effect=idempotent，不产生
+      新记录）；同标识但任一字段不同 -> 409；窗口不存在 -> 404；
+    - 已撤回的标识不能再次登记（409）；撤回请使用撤回端点。
+    """
+
+    fault_id: str = Field(..., min_length=1, max_length=100,
+                          description="故障标识（同一窗口内唯一）")
+    start_at: datetime = Field(..., description="故障时段起点（含，半开区间），带时区")
+    end_at: datetime = Field(..., description="故障时段终点（不含，半开区间），带时区")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="失准确认原因（非空，不能只含空白字符）")
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _tz_aware(cls, v: datetime) -> datetime:
+        return _require_aware(v)
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("故障原因不能为空（不能只含空白字符）")
+        return v
+
+
+class InstrumentFaultWithdrawSubmit(BaseModel):
+    """撤回仪器失准故障：凭故障标识（路径）+ 非空原因。
+
+    - 撤回只改变故障有效性（状态置 withdrawn，留存撤回原因与时间），
+      撤回后该时段不再参与遮蔽并集，当前审定立即重算；
+    - 同一故障以相同原因重复撤回 -> 幂等（返回原撤回记录，撤回时间不变）；
+      已撤回故障以不同原因再次撤回 -> 409；
+    - 原因为空或只含空白 -> 422；故障标识不存在 -> 404。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="撤回原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("撤回原因不能为空（不能只含空白字符）")
+        return v
+
+
+class InstrumentFaultOut(BaseModel):
+    """仪器失准故障记录（有效或已撤回）。"""
+
+    fault_id: str
+    start_at: str = Field(..., description="故障时段起点（含，UTC，半开区间）")
+    end_at: str = Field(..., description="故障时段终点（不含，UTC，半开区间）")
+    reason: str = Field(..., description="登记原因")
+    status: str = Field(..., description="active | withdrawn")
+    registered_at: str = Field(..., description="登记时间（UTC）")
+    withdrawn_reason: Optional[str] = Field(None, description="撤回原因（仅已撤回故障）")
+    withdrawn_at: Optional[str] = Field(None, description="撤回操作时间（仅已撤回故障）")
+
+
+class InstrumentFaultResponse(BaseModel):
+    effect: str = Field(..., description="registered | idempotent")
+    fault: InstrumentFaultOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="登记/重放后按有效故障时段遮蔽立即重算的审定结果")
+
+
+class InstrumentFaultWithdrawResponse(BaseModel):
+    effect: str = Field(..., description="withdrawn | idempotent")
+    fault: InstrumentFaultOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="撤回后立即重算的审定结果")
+
+
 # ------------------------------------------------------------ 证书撤销
 
 class CertificateRevokeSubmit(BaseModel):
@@ -275,6 +357,9 @@ class WindowOut(BaseModel):
     current_verdict: Optional[str] = Field(None, description="当前可用证书结论；无则为 null")
     current_certificate: Optional["CertificateOut"] = Field(
         None, description="窗口详情中给出的当前可用证书完整内容（列表端点不返回）；无则为 null")
+    active_instrument_faults: list["InstrumentFaultOut"] = Field(
+        default_factory=list,
+        description="当前有效（未撤回）的仪器失准故障时段，按起点升序；列表端点同样返回")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -385,6 +470,37 @@ class ReportReadingsDiff(BaseModel):
     changed_count: int
 
 
+# ----------------------------------------------------- 仪器失准故障差异
+
+class ReportFault(BaseModel):
+    fault_id: str
+    start_at: str
+    end_at: str
+    reason: str
+
+
+class ReportFaultChange(BaseModel):
+    fault_id: str
+    before: ReportFault
+    after: ReportFault
+    changed_fields: list[str] = Field(..., description="start_at | end_at | reason")
+
+
+class ReportInstrumentFaultsDiff(BaseModel):
+    """两证快照有效仪器失准故障时段差异（旧快照缺字段视为空）。
+
+    registered：新证新登记故障；withdrawn：旧证有、新证已撤回（消失）；
+    changed：同标识但时段或原因变化。
+    """
+
+    registered: list[ReportFault]
+    withdrawn: list[ReportFault]
+    changed: list[ReportFaultChange]
+    registered_count: int
+    withdrawn_count: int
+    changed_count: int
+
+
 class ReportTimelineSide(BaseModel):
     status: str
     # 键随状态而定：已知区段 {"reading_id","revision"}；
@@ -463,6 +579,8 @@ class RevisionReportOut(BaseModel):
     new_certificate: ReportCertificateRef
     rules_diff: ReportRulesDiff
     readings_diff: ReportReadingsDiff
+    instrument_faults_diff: ReportInstrumentFaultsDiff = Field(
+        ..., description="两证快照有效仪器失准故障时段差异（新登记/撤回/变更）")
     timeline: ReportTimeline
     summary: ReportSummary
 
@@ -526,3 +644,6 @@ class ErrorBody(BaseModel):
 # WindowOut.current_certificate 前向引用了后文定义的 CertificateOut，
 # 全部模型定义完成后重建一次以解析该引用。
 WindowOut.model_rebuild()
+# 故障请求模型在 EvaluationOut 之前定义，重建以解析其前向引用。
+InstrumentFaultResponse.model_rebuild()
+InstrumentFaultWithdrawResponse.model_rebuild()

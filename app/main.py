@@ -18,6 +18,11 @@ from .schemas import (
     HandoverOrderOut,
     HandoverOrderSubmit,
     HandoverOrderSubmitResponse,
+    InstrumentFaultOut,
+    InstrumentFaultResponse,
+    InstrumentFaultSubmit,
+    InstrumentFaultWithdrawResponse,
+    InstrumentFaultWithdrawSubmit,
     IssueRequest,
     ReadingBatchSubmit,
     ReadingBatchSubmitResponse,
@@ -49,16 +54,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
         "支持读数修订、幂等提交（单条与批量补传）、误采作废与恢复、"
         "窗口规则版本化修订（初始规则为第 1 版，连续修订号 + 非空原因）、"
+        "仪器失准故障时段登记与撤回（带标识、非空原因、带时区半开时段，"
+        "完全落在窗口内；有效故障取并集遮蔽时间线，遮蔽部分无论有无读数均为未知，"
+        "故障边界切断连续超限，立即重算；同标识同内容重放幂等、撤回同因幂等）、"
         "证书版本化签发与已签发证书撤销（凭非空原因，只改有效性、快照不变；"
         "仅最新签发版本未撤销时窗口有当前可用证书），"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
-        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）；"
+        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值；"
+        "跨证故障修订从各自快照还原遮蔽造成的时间线变化）；"
         "馆员办理展柜移交时凭非空移交单号与非空窗口标识列表申请放行："
         "逐窗口核对当前可用证书且结论合格才一次登记（固化证书标识/版本/结论），"
         "查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效"
@@ -271,6 +280,81 @@ def list_reading_revisions(
     """该读数 ID 的全部修订历史（含作废记录），按修订号升序。"""
     services.get_window_row(conn, window_id)
     return services.list_reading_revisions(conn, window_id, reading_id)
+
+
+# ------------------------------------------------------------ 仪器失准故障
+
+@app.post(
+    "/api/v1/windows/{window_id}/instrument-faults",
+    response_model=InstrumentFaultResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["instrument-faults"],
+)
+def register_instrument_fault(
+    window_id: int,
+    payload: InstrumentFaultSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员确认采样仪器失准：登记带标识、非空原因、带时区起止时间的故障时段。
+
+    - 时段为半开 [start_at, end_at)，start_at 必须严格早于 end_at，
+      且完全落在审定窗口 [窗口起点, 窗口终点) 内（两端不得越界）；
+      缺时区、空原因 -> 422；窗口不存在 -> 404；
+    - 同标识同时段同原因重放 -> effect=idempotent（不产生新记录、不改状态）；
+      同标识但时段或原因不同 -> 409；已撤回标识再次登记 -> 409；
+    - 成功后有效故障时段取并集立即重算（响应含 current_evaluation）：
+      遮蔽部分无论有无读数均为未知，故障边界切断连续超限。
+    """
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effect, fault = services.register_instrument_fault(conn, window_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effect": effect, "fault": fault,
+                "current_evaluation": evaluation}
+
+
+@app.post(
+    "/api/v1/windows/{window_id}/instrument-faults/{fault_id}/withdrawal",
+    response_model=InstrumentFaultWithdrawResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["instrument-faults"],
+)
+def withdraw_instrument_fault(
+    window_id: int,
+    fault_id: str,
+    payload: InstrumentFaultWithdrawSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """凭故障标识（路径）+ 非空原因撤回仪器失准故障时段。
+
+    - 撤回只改变有效性（置 withdrawn，留存撤回原因与时间），撤回后该时段
+      不再参与遮蔽并集，当前审定立即重算（响应含 current_evaluation）；
+    - 相同原因重复撤回 -> effect=idempotent，返回原撤回记录（撤回时间不变）；
+      已撤回故障以不同原因撤回 -> 409；
+    - 空原因（或缺字段）-> 422；未知标识 -> 404。
+    """
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effect, fault = services.withdraw_instrument_fault(
+            conn, window_id, fault_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effect": effect, "fault": fault,
+                "current_evaluation": evaluation}
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/instrument-faults",
+    response_model=list[InstrumentFaultOut],
+    tags=["instrument-faults"],
+)
+def list_instrument_faults(
+    window_id: int,
+    active_only: bool = Query(False, description="仅返回当前有效（未撤回）故障"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict[str, Any]]:
+    """窗口仪器失准故障记录（默认含已撤回，按登记时间升序）。"""
+    services.get_window_row(conn, window_id)
+    return services.list_instrument_faults(conn, window_id, active_only=active_only)
 
 
 # ---------------------------------------------------------------- 签发

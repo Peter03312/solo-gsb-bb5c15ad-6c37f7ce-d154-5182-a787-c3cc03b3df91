@@ -8,6 +8,11 @@
 证书版本化签发（快照不可变）与**已签发证书撤销**（馆员发现签发依据有误时，
 凭证书标识 + 非空原因撤销；撤销只改有效性，版本/结论/快照原样保留，
 仅最新签发版本未撤销时窗口有当前可用证书，撤销最新版不自动退回旧版），
+支持**仪器失准故障时段登记与撤回**（馆员确认仪器失准时，按窗口登记带标识、
+非空原因、带时区起止时间的半开故障时段，可凭标识和非空原因撤回；
+审定把有效故障时段取并集遮蔽时间线，遮蔽部分无论有无读数均为未知，
+故障边界切断连续超限，立即重算；新签证书固化有效故障时段及结果，
+跨证修订影响报告从各自快照还原故障造成的时间线变化），
 支持馆员对窗口四项审定规则做
 **版本化修订**（初始规则为第 1 版，连续修订号 + 非空原因，立即重算、
 既有证书快照不变），并可对同一审定窗口的两张已签发证书生成
@@ -198,6 +203,82 @@
   符合**实际提交顺序**：撤销先提交则新版本成为当前可用；签发先提交则其成为
   当前可用、随后的撤销只作用于被指定的那张证书。
 
+### 仪器失准故障时段
+
+馆员确认采样仪器在审定窗口内失准时，
+`POST /api/v1/windows/{id}/instrument-faults` 按窗口登记一个**带故障标识、
+非空原因、带时区起止时间**的故障时段：
+
+```json
+{
+  "fault_id": "F-2026-1001-01",
+  "start_at": "2026-10-01T00:30:00Z",
+  "end_at":   "2026-10-01T00:40:00Z",
+  "reason":   "馆员现场确认温度计该时段失准"
+}
+```
+
+- **半开区间 `[start_at, end_at)`**：`start_at` 必须**严格早于** `end_at`；
+  时段必须**完全落在窗口内**（故障按窗口半开 `[窗口起点, 窗口终点)` 判定：
+  允许故障恰从窗口起点开始、恰在窗口终点结束，不得越界）；起止时间必须
+  **带时区**（`+08:00` 与 `Z` 统一按时刻比较并归一为 UTC 输出）。
+- 登记成功（`effect: registered`）后在同一事务内**立即重算**，响应含
+  `current_evaluation`；同一窗口可登记多个故障（标识各自唯一），允许时段
+  重叠，审定时取并集。
+- **幂等与冲突**（沿用现有 409 语义）：
+  - **同标识 + 同时段 + 同原因**重放 → 幂等（`effect: idempotent`，返回原
+    记录、不产生新记录、不改状态，时间戳按时刻比较，时区表示不同不算差异）；
+  - **同标识但时段或原因任一不同** → **409 内容冲突**；
+  - **已撤回**的故障标识不能再次登记 → **409**（撤回不可逆；如需登记新故障
+    请使用新标识）。
+- **撤回**：`POST /api/v1/windows/{id}/instrument-faults/{fault_id}/withdrawal`
+  凭**故障标识（路径）+ 非空原因**撤回（body `{"reason":"..."}`）：
+  - 撤回只改变有效性（置 `withdrawn`，留存撤回原因 `withdrawn_reason` 与
+    撤回时间 `withdrawn_at`），登记时的时段/原因/登记时间原样保留；
+  - 撤回后该时段**不再参与遮蔽并集**，在同一事务内**立即重算**（响应含
+    `current_evaluation`）；
+  - **相同原因重复撤回** → 幂等（`effect: idempotent`，返回原撤回记录、
+    撤回时间不变，不产生新事件）；**已撤回故障以不同原因撤回** → **409**。
+- **拒绝（均不改状态）**：
+  - 时段非法（`start_at >= end_at`、越出窗口、缺时区）或**原因为空/只含空白**
+    （撤回原因同理）→ **422**，整笔事务回滚、不写故障记录（该标识随后仍可
+    正常使用）；
+  - 撤回/重放时**故障标识在该窗口从未存在** → **404**；窗口不存在 → **404**。
+- **查询**：`GET /api/v1/windows/{id}/instrument-faults` 返回该窗口全部故障
+  记录（含已撤回，按登记时间升序）；`?active_only=true` 只返回当前有效故障；
+  窗口详情与列表新增 `active_instrument_faults`（当前有效故障，按起点升序；
+  列表端点也返回该字段）。
+
+**审定如何处理有效故障时段**（对“审定规则”一节的增量，读数与既有规则不变）：
+
+1. 取窗口内全部**有效（未撤回）**故障时段的**并集**（重叠/相接自动合并）；
+2. 并集**遮蔽**部分——无论其中**有无读数**、原区段是正常/超限/采样间隔未知——
+   一律记为 **未知**；**未遮蔽部分沿用原采样保持与采样间隔规则**（相邻读数
+   间隔严格超过 `T_gap` 仍未知、边界无读数仍未知）；
+3. **故障边界切断连续超限**：一段连续超限被故障遮蔽切开后，两侧分别重新
+   累计最长连续超限时长（遮蔽段不是超限）；随后**按原结论优先级立即重算**
+   （最长连续超限严格大于 `T_exceed` → 不合格；否则有未知 → 待定；
+   否则合格）。读数计数 `reading_count` 不因遮蔽而减少。
+
+**与证书/报告的关系**：
+
+- **新签发证书固化签发时的有效故障时段**（快照新增 `instrument_faults`：
+  每项含 `fault_id`/`start_at`/`end_at`/`reason`/`registered_at`）**及据此
+  重算的审定结果**；撤回故障或登记新故障后再次签发形成新版本，**旧证书快照
+  永不改变**（旧证书内的故障与结论原样保留）。
+- **跨证修订影响报告**只依两证各自的不可变快照：新增 `instrument_faults_diff`
+  （`registered` 新登记 / `withdrawn` 撤回消失 / `changed` 同标识时段或原因
+  变化，及对应计数）；`timeline.changes` **从两证各自快照还原故障造成的
+  时间线变化**——遮蔽段证据为
+  `{"unknown_reason":"instrument_fault","fault_id":"..."}`，故障边界与读数
+  边界共同参与对齐；多个故障重叠时，重叠部分归属起点最早的故障标识。
+  **故障功能上线前签发的旧证书快照没有 `instrument_faults` 字段，还原时
+  视为空**（不报错）。
+- 既有读数、规则、证书撤销、移交放行单接口的**字段含义不变**（`instrument_faults`、
+  `active_instrument_faults`、`instrument_faults_diff` 均为纯增量字段）；
+  移交放行仍只核对当前可用证书与结论——故障使窗口结论变为待定/不合格后，
+  新签发证书不再满足放行合格条件。
+
 ### 展柜移交放行单
 
 馆员办理展柜移交时，`POST /api/v1/handover-orders` 凭**非空移交单号**
@@ -299,6 +380,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/v1/windows/{id}/certificates/current` | 窗口当前可用证书：仅最新签发版本未撤销时存在（无则 409；窗口不存在 404；撤销最新版不自动退回旧版） |
 | `POST` | `/api/v1/windows/{id}/rule-revisions` | 规则版本化修订：目标修订号（当前版+1 生效）+ 四项完整新值 + 非空原因，响应含立即重算结果；同号同值同原因重放幂等 |
 | `GET` | `/api/v1/windows/{id}/rule-revisions` | 该窗口全部规则修订历史（第 1 版为初始规则，升序） |
+| `POST` | `/api/v1/windows/{id}/instrument-faults` | 登记仪器失准故障时段：窗口内唯一故障标识 + 非空原因 + 带时区半开时段（完全落在窗口内、起点严格早于终点），响应含立即重算结果；同标识同时段同原因重放幂等、异内容 409、已撤回标识再登记 409、非法时段/空原因 422 |
+| `POST` | `/api/v1/windows/{id}/instrument-faults/{fault_id}/withdrawal` | 凭故障标识 + 非空原因撤回：只改有效性并立即重算；同因重放幂等、异因 409、空原因 422、未知标识 404 |
+| `GET` | `/api/v1/windows/{id}/instrument-faults` | 窗口全部故障记录（含已撤回，登记时间升序）；`?active_only=true` 仅有效故障 |
 
 创建窗口请求体：
 
@@ -363,6 +447,79 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     "previous": { "revision": 1, "measured_at": "2026-10-01T00:30:00Z", "temperature": 20.5 }
   },
   "current_evaluation": { "verdict": "pass", "...": "..." }
+}
+```
+
+### 仪器失准故障
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/windows/{id}/instrument-faults` | 登记故障时段（窗口内唯一标识 + 非空原因 + 带时区半开起止），响应 `effect` 为 `registered`/`idempotent`，含 `fault` 与立即重算的 `current_evaluation` |
+| `POST` | `/api/v1/windows/{id}/instrument-faults/{fault_id}/withdrawal` | 凭标识 + 非空原因撤回，响应 `effect` 为 `withdrawn`/`idempotent`，含撤回后 `fault` 与重算结果 |
+| `GET` | `/api/v1/windows/{id}/instrument-faults` | 故障记录列表（默认含已撤回；`?active_only=true` 仅返回有效故障） |
+
+登记请求与响应（半开 `[start_at, end_at)`；时区可混用，统一按时刻归一为 UTC）：
+
+```json
+// POST /api/v1/windows/1/instrument-faults
+{
+  "fault_id": "F-001",
+  "start_at": "2026-10-01T08:30:00+08:00",
+  "end_at":   "2026-10-01T08:40:00+08:00",
+  "reason": "馆员现场确认温度计该时段失准"
+}
+// 201 ->
+{
+  "effect": "registered",
+  "fault": {
+    "fault_id": "F-001",
+    "start_at": "2026-10-01T00:30:00Z",
+    "end_at":   "2026-10-01T00:40:00Z",
+    "reason": "馆员现场确认温度计该时段失准",
+    "status": "active",
+    "registered_at": "2026-10-02T06:00:00.000Z",
+    "withdrawn_reason": null, "withdrawn_at": null
+  },
+  "current_evaluation": {
+    "verdict": "pending",
+    "unknown_segments": [{"start":"2026-10-01T00:30:00Z","end":"2026-10-01T00:40:00Z",
+                          "status":"unknown","duration_seconds":600.0}],
+    "max_continuous_exceeded_seconds": 1800.0,
+    "...": "遮蔽部分无论有无读数均为未知；故障边界切断连续超限"
+  }
+}
+```
+
+> 同标识同时段同原因重放 → `effect: idempotent`（返回原记录）；时段或原因
+> 任一不同 → **409**；已撤回标识再登记 → **409**。
+
+撤回请求与响应：
+
+```json
+// POST /api/v1/windows/1/instrument-faults/F-001/withdrawal
+// {"reason": "校准恢复，撤回"}
+{
+  "effect": "withdrawn",
+  "fault": { "fault_id": "F-001", "status": "withdrawn",
+             "withdrawn_reason": "校准恢复，撤回",
+             "withdrawn_at": "2026-10-02T06:10:00.000Z", "...": "..." },
+  "current_evaluation": { "verdict": "fail", "...": "撤回后按原规则立即重算" }
+}
+```
+
+新签发证书快照内新增的故障字段（旧证无此字段，报告还原时视为空）：
+
+```json
+"snapshot": {
+  "window": {"rule_revision": 2, "...": "..."},
+  "evaluation": { "verdict": "pending", "...": "..." },
+  "readings": [ {"...": "..."} ],
+  "instrument_faults": [
+    {"fault_id": "F-001", "start_at": "2026-10-01T00:30:00Z",
+     "end_at": "2026-10-01T00:40:00Z", "reason": "馆员现场确认温度计该时段失准",
+     "status": "active", "registered_at": "2026-10-02T06:00:00.000Z",
+     "withdrawn_reason": null, "withdrawn_at": null}
+  ]
 }
 ```
 
@@ -482,9 +639,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     采样时间按时刻比较，时区表示不同不视为变化）；
   - `removed`：新版消失的读数（两证签发之间该读数被误采作废；恢复后再次
     签发则体现为 `added`）；
-- `timeline.changes`：**分别用两版快照各自的窗口参数与读数**重建半开覆盖
-  区段（与第 1 节同一条采样保持/间隔超限/边界空白规则；跨规则版本时
-  两证各按各的温度区间与时长限值判定），取两版**全部区段边界
+- `instrument_faults_diff`：按 `fault_id` 对齐两版快照固化的**有效仪器
+  失准故障时段**——`registered`（新登记）/`withdrawn`（旧证有、新证已撤回
+  而消失）/`changed`（同标识但 `start_at`/`end_at`/`reason` 变化）及各计数；
+  故障功能上线前的旧快照无该字段，按空处理。
+- `timeline.changes`：**分别用两版快照各自的窗口参数、读数与有效故障时段**
+  重建半开覆盖区段（与第 1 节同一条采样保持/间隔超限/边界空白规则；跨规则
+  版本时两证各按各的温度区间与时长限值判定；**有效故障并集遮蔽部分无论有无
+  读数均为未知，故障边界参与切分并切断连续超限**），取两版**全部区段边界
   的并集**切分后，只保留**状态发生变化**的半开区间，每个区间给出：
   - `start`/`end`/`duration_seconds`（半开 `[start, end)`）；
   - `before`/`after`：变化前后 `status`（`normal`/`exceeded`/`unknown`）
@@ -494,9 +656,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
       最大采样间隔，附 `left_*`/`right_*` 间隔两侧读数 ID 与修订号）或
       `boundary_gap`（边界无读数空白，附 `boundary_side`：`leading` 首读
       之前并给 `right_*` 首条读数、`trailing` 末读之后并给 `left_*` 末条
-      读数、`empty` 整窗无读数两侧均无引用）。
+      读数、`empty` 整窗无读数两侧均无引用），或
+      `instrument_fault`（有效故障时段遮蔽，附 `fault_id`；多个故障重叠时
+      重叠部分归属起点最早的故障）。
   - 相邻且变化前后**状态与证据均相同**的区间自动合并（被无变化区间隔开的
-    不合并）。
+    不合并）；同一段故障遮蔽连续若干读数时按故障段合并（被遮蔽读数身份不
+    切段），相邻的不同故障段不合并。
 - `summary`：审定结论变化（`verdict_before/after`、中文标签、
   `verdict_direction` 改善/恶化/持平）、最长连续超限时长前后值与增量
   `max_continuous_exceeded_seconds_delta`、时间线变化区间数，以及一段
@@ -547,6 +712,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     }],
     "added_count": 0, "removed_count": 0, "changed_count": 2
   },
+  "instrument_faults_diff": {
+    "registered": [], "withdrawn": [], "changed": [],
+    "registered_count": 0, "withdrawn_count": 0, "changed_count": 0
+  },
   "timeline": {
     "max_sample_interval_seconds": 600.0,
     "change_count": 2,
@@ -574,6 +743,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 - `404`：窗口/证书不存在（修订影响报告中任一证书缺失、撤销目标证书不存在）；
   作废或查询修订历史时读数从未存在；
+  **仪器故障：撤回时故障标识在该窗口从未存在**；
   **移交单：申请放行时任一窗口不存在；按单号查询时移交单不存在**
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
@@ -581,6 +751,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   规则修订同号但四项值/原因不一致、旧号提交、跳号提交；
   **已撤销证书以不同原因再次撤销（原因冲突）；窗口当前没有可用证书时
   查询当前可用证书（尚无证书，或最新签发版本已撤销且不自动退回旧版）**；
+  **仪器故障：同标识但时段/原因不一致（内容冲突）；已撤回标识再次登记；
+  已撤回故障以不同原因撤回（原因冲突）**；
   **移交单：任一窗口缺当前可用证书或结论非合格（整单不留记录）；
   同一移交单号以不同窗口集合重复申请（集合不一致）**
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
@@ -588,6 +760,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   作废原因为空或只含空白等；
   规则修订数值非有限、温度下限大于上限、时长非正、原因为空或只含空白；
   **撤销原因为空或只含空白（或缺 `reason` 字段）**；
+  **仪器故障：时段起点不严格早于终点、时段越出窗口半开边界、起止缺时区、
+  登记/撤回原因为空或只含空白（整笔拒收且不改状态）**；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422；
   **移交单：窗口标识列表为空、列表内标识重复、移交单号为空或只含空白**
 
@@ -601,13 +775,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 已签发证书撤销 → 展柜移交放行单）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 已签发证书撤销 → 仪器失准故障登记/遮蔽/撤回与跨证报告 → 展柜移交放行单）
 bash examples/curl-examples.sh
 
 # Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、已签发证书撤销与当前可用证书、展柜移交放行单）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
+
+# 仪器失准故障本轮全流程（仅标准库：登记→遮蔽重算→幂等/冲突→签发固化→
+# 跨证报告→撤回恢复；含 422/404/409 拒收路径）
+BASE_URL=http://127.0.0.1:8000 python3 examples/instrument_fault_flow.py
 ```
 
 修订影响报告最小示例（`OLD_ID`、`NEW_ID` 为同一窗口两张已签发证书主键）：
@@ -716,6 +894,31 @@ curl -sS http://localhost:8000/api/v1/windows/1/certificates
 curl -sS http://localhost:8000/api/v1/windows/1/certificates/current
 ```
 
+仪器失准故障最小示例（承接窗口 `1`；半开时段、带时区、完全落在窗口内）：
+
+```bash
+# 登记：标识 + 非空原因 + 带时区起止；立即重算（遮蔽段无论有无读数均为未知）
+curl -sS http://localhost:8000/api/v1/windows/1/instrument-faults \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_id":"F-001","start_at":"2026-10-01T00:30:00Z",
+       "end_at":"2026-10-01T00:40:00Z","reason":"温度计该时段失准"}'
+# -> {"effect":"registered","fault":{...,"status":"active"},
+#     "current_evaluation":{"verdict":"pending",...}}
+
+# 同标识同时段同原因重放 -> effect=idempotent；时段/原因不同 -> 409；
+# 起点不早于终点/越出窗口/缺时区/空原因 -> 422（拒收且不改状态）
+
+# 撤回：标识（路径）+ 非空原因；撤回后立即重算
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/instrument-faults/F-001/withdrawal \
+  -H 'Content-Type: application/json' -d '{"reason":"校准恢复，撤回"}'
+# 相同原因重放 -> effect=idempotent（返回原记录）；不同原因 -> 409；
+# 未知标识 -> 404；空原因 -> 422
+
+# 查询：全部故障（含已撤回）/ 仅有效故障
+curl -sS http://localhost:8000/api/v1/windows/1/instrument-faults
+curl -sS "http://localhost:8000/api/v1/windows/1/instrument-faults?active_only=true"
+```
+
 展柜移交放行单最小示例（承接已有两个合格窗口 `1`、`2` 且各有当前可用证书）：
 
 ```bash
@@ -748,6 +951,9 @@ PYTHONPATH=. python -m pytest tests/ -q
 
 - `tests/test_evaluation.py`：审定算法纯函数测试（未知/超限/合格、
   边界等于、时区归一、区段无缝拼接等）。
+- `tests/test_instrument_fault_eval.py`：故障遮蔽纯函数测试（遮蔽无论有无
+  读数均为未知、半开端点、整窗覆盖、重叠/相接故障取并集、故障边界切断
+  连续超限、与采样间隔未知合并、dict/时区输入、读数计数不减少）。
 - `tests/test_report.py`：修订影响报告纯函数测试（读数差异、带证据
   区段、边界对齐、未知来源、区间合并、汇总方向）。
 - `tests/test_api.py`：HTTP 集成测试（幂等、冲突、修订替换、拒收、
@@ -775,6 +981,14 @@ PYTHONPATH=. python -m pytest tests/ -q
   异因 409、空白原因 422、不存在 404；撤销最新版不退回旧版、撤销旧版
   不影响当前；再签发沿用递增版本并成为当前；撤销/签发并发符合提交顺序；
   旧库 ALTER 补列迁移且旧证书默认未撤销）。
+- `tests/test_instrument_fault_api.py`：仪器失准故障 HTTP 集成测试
+  （带标识/非空原因/带时区半开时段登记与立即重算；同标识同内容重放幂等、
+  异内容 409、已撤回标识再登记 409；撤回同因幂等/异因 409/未知标识 404；
+  非法时段/越界/空原因/缺时区 422 且不改状态；贴窗口边界允许、+08:00 时区
+  归一；遮蔽切断连续超限、撤回恢复；窗口详情/列表有效故障字段；
+  新签证书固化故障、旧证快照不变；跨证报告 registered/withdrawn 与
+  instrument_fault 证据、多故障重叠归属、旧快照缺字段视为空；
+  移交合格性受故障结论影响）。
 - `tests/test_handover_api.py`：展柜移交放行单 HTTP 测试
   （非空单号 + 非空窗口标识列表申请放行，全部窗口合格才一次登记并固化
   证书标识/版本/结论；空列表/重复标识/空白单号 422、窗口不存在 404、
@@ -788,16 +1002,17 @@ PYTHONPATH=. python -m pytest tests/ -q
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
-  evaluation.py    # 核心审定算法（纯函数）
-  report.py        # 修订影响报告（规则前后值、快照比对、时间线对齐，纯函数）
-  models.py        # 结论枚举/常量（含移交单有效状态）
-  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单）
-  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、证书撤销、修订影响报告、移交放行单业务逻辑
+  database.py      # SQLite 连接、WAL、建表（含仪器故障表/旧库补列迁移/规则第 1 版回填/证书撤销列/移交单表）、写事务（BEGIN IMMEDIATE）与读事务（一致快照）
+  evaluation.py    # 核心审定算法（纯函数；含有效故障时段并集遮蔽、故障边界切断连续超限）
+  report.py        # 修订影响报告（规则前后值、快照比对、读数/故障差异、故障遮蔽时间线对齐，纯函数）
+  models.py        # 结论枚举/常量（含移交单有效状态、仪器故障 active/withdrawn）
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销、移交放行单、仪器故障登记/撤回）
+  services.py      # 窗口、规则版本化修订、读数（含误采作废/恢复）、仪器失准故障登记/撤回、审定（含遮蔽重算）、签发（固化故障）、证书撤销、修订影响报告、移交放行单业务逻辑
   main.py          # FastAPI 路由
 examples/
-  curl-examples.sh
+  curl-examples.sh           # 全流程 curl（第 18 节为仪器失准故障）
   python_client.py
+  instrument_fault_flow.py   # 本轮仪器失准故障端到端调用示例（仅标准库）
 tests/
 Dockerfile
 docker-compose.yml

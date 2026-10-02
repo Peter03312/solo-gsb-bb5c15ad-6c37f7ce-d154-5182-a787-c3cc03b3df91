@@ -379,3 +379,81 @@ api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1,
 api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"撤销后重签"}' >/dev/null
 api GET /api/v1/handover-orders/$HNO \
   | python3 -c "import sys,json;o=json.load(sys.stdin);print('再签发后 status:',o['status']);print('明细仍固化:',[(i['certificate_id'],i['certificate_version'],i['verdict']) for i in o['items']])"
+
+echo "== 18. 仪器失准故障时段（单独建窗口演示；遮蔽无论有无读数均为未知，故障边界切断连续超限）=="
+FW=$(api POST /api/v1/windows '{
+  "name": "展柜I-仪器失准",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 2000,
+  "max_sample_interval_seconds": 1200
+}')
+FID_W=$(echo "$FW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 每分钟一条 23°C（超限）读数，末读恰在终点 -> 连续超限 3600s > 2000s，fail
+for m in $(seq 0 60); do
+  MM=$(printf "%02d" "$m")
+  TS=$(date -u -d "2026-10-01T00:00:00Z +$m minutes" +%Y-%m-%dT%H:%M:%SZ)
+  api POST "/api/v1/windows/$FID_W/readings" \
+    "{\"reading_id\":\"r-$MM\",\"revision\":1,\"measured_at\":\"$TS\",\"temperature\":23.0}" >/dev/null
+done
+api GET "/api/v1/windows/$FID_W/evaluation" \
+  | python3 -c "import sys,json;e=json.load(sys.stdin);print('登记故障前: verdict',e['verdict'],'最长连续超限',e['max_continuous_exceeded_seconds'],'s')"
+
+FC1=$(api POST "/api/v1/windows/$FID_W/certificates/issue" '{"note":"故障前"}')
+FC1_ID=$(echo "$FC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 18.1 拒收：起点晚于终点 422 / 越出窗口 422 / 空原因 422（均不改状态）--"
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"BAD","start_at":"2026-10-01T00:40:00Z","end_at":"2026-10-01T00:30:00Z","reason":"倒置"}' || true
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"BAD","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T01:01:00Z","reason":"越界"}' || true
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"BAD","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:20:00Z","reason":"  "}' || true
+
+echo "-- 18.2 登记 F1：半开 [00:30,00:40)（+08:00 时区演示，统一按时刻归一为 UTC），立即重算 --"
+# 遮蔽 600s 后超限被切成 1800s / 1200s，均不超过限值 2000s；存在未知 -> pending
+api POST "/api/v1/windows/$FID_W/instrument-faults" '{
+  "fault_id": "F1",
+  "start_at": "2026-10-01T08:30:00+08:00",
+  "end_at":   "2026-10-01T08:40:00+08:00",
+  "reason": "馆员确认温度计该时段失准"
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);e=d['current_evaluation'];print('effect:',d['effect'],'UTC:',d['fault']['start_at'],'->',d['fault']['end_at']);print('verdict:',e['verdict'],'最长连续超限:',e['max_continuous_exceeded_seconds'],'s 未知段:',[(u['start'][11:16],u['end'][11:16]) for u in e['unknown_segments']])"
+
+echo "-- 18.3 同标识同内容重放 -> 幂等（不产生新记录）；时段/原因任一不同 -> 409 --"
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"F1","start_at":"2026-10-01T00:30:00Z","end_at":"2026-10-01T00:40:00Z","reason":"馆员确认温度计该时段失准"}' \
+  | python3 -c "import sys,json;print('effect:',json.load(sys.stdin)['effect'])"
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"F1","start_at":"2026-10-01T00:30:00Z","end_at":"2026-10-01T00:41:00Z","reason":"馆员确认温度计该时段失准"}' || true
+
+echo "-- 18.4 签发 v2 固化有效故障；跨证报告 v1->v2 从各自快照还原故障遮蔽的时间线变化 --"
+FC2=$(api POST "/api/v1/windows/$FID_W/certificates/issue" '{"note":"故障遮蔽中"}')
+FC2_ID=$(echo "$FC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "v2 快照故障: $(echo "$FC2" | python3 -c "import sys,json;print([(f['fault_id'],f['start_at'],f['end_at']) for f in json.load(sys.stdin)['snapshot']['instrument_faults']])")"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$FC1_ID&new_certificate_id=$FC2_ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('结论:',d['summary']['verdict_before'],'->',d['summary']['verdict_after']);print('故障差异:',d['instrument_faults_diff']);print('时间线变化:',[(c['start'][11:16],c['end'][11:16],c['before']['status'],c['after']['status'],c['after']['evidence']) for c in d['timeline']['changes']])"
+
+echo "-- 18.5 撤回 F1（非空原因）：立即重算恢复；同因重放幂等、异因 409、未知标识 404 --"
+api POST "/api/v1/windows/$FID_W/instrument-faults/F1/withdrawal" '{"reason":"校准恢复，撤回"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);e=d['current_evaluation'];print('effect:',d['effect'],'verdict:',e['verdict'],'最长连续超限:',e['max_continuous_exceeded_seconds'],'s has_unknown:',e['has_unknown'])"
+api POST "/api/v1/windows/$FID_W/instrument-faults/F1/withdrawal" '{"reason":"校准恢复，撤回"}' \
+  | python3 -c "import sys,json;print('同因重放 effect:',json.load(sys.stdin)['effect'])"
+api POST "/api/v1/windows/$FID_W/instrument-faults/F1/withdrawal" '{"reason":"另一个原因"}' || true
+api POST "/api/v1/windows/$FID_W/instrument-faults/NOPE/withdrawal" '{"reason":"x"}' || true
+
+echo "-- 18.6 已撤回标识不能再次登记（409，撤回不可逆）；新故障请用新标识 --"
+api POST "/api/v1/windows/$FID_W/instrument-faults" \
+  '{"fault_id":"F1","start_at":"2026-10-01T00:30:00Z","end_at":"2026-10-01T00:40:00Z","reason":"馆员确认温度计该时段失准"}' || true
+
+echo "-- 18.7 查询故障记录（含已撤回）与仅有效故障；窗口详情携带 active_instrument_faults --"
+api GET "/api/v1/windows/$FID_W/instrument-faults" | python3 -m json.tool
+api GET "/api/v1/windows/$FID_W/instrument-faults?active_only=true" \
+  | python3 -c "import sys,json;print('仅有效故障:',json.load(sys.stdin))"
+api GET "/api/v1/windows/$FID_W" \
+  | python3 -c "import sys,json;print('窗口当前有效故障数:',len(json.load(sys.stdin)['active_instrument_faults']))"
+
+echo "-- 18.8 旧证 v2 快照不因撤回而改变（固化的故障与结果原样保留）--"
+api GET "/api/v1/certificates/$FC2_ID" \
+  | python3 -c "import sys,json;c=json.load(sys.stdin);print('v2 verdict:',c['verdict'],'快照故障:',[f['fault_id'] for f in c['snapshot']['instrument_faults']])"

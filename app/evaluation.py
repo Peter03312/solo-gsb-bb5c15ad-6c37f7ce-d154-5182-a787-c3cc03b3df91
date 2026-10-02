@@ -23,12 +23,19 @@ from typing import Any, Iterable, Sequence
 
 from .models import Verdict
 
+# 未知子原因（仅内部使用）：审定器本身只输出三态状态，
+# 报告层（report.py）用 instrument_fault 标识故障遮蔽证据。
+UNKNOWN_FAULT = "instrument_fault"
+
 
 @dataclass(frozen=True)
 class Segment:
     start: datetime
     end: datetime
     status: str  # "normal" | "exceeded" | "unknown"
+    # 未知子原因（仅内部）：sample_gap/boundary_gap 为 None；
+    # instrument_fault 表示该段被有效仪器失准故障时段遮蔽。
+    unknown_reason: str | None = None
 
     def duration(self) -> float:
         return (self.end - self.start).total_seconds()
@@ -98,6 +105,57 @@ def _merge_adjacent(segments: Iterable[Segment]) -> list[Segment]:
     return merged
 
 
+def union_intervals(
+    intervals: Sequence[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """把若干半开区间取并集：排序后合并重叠/首尾相接的区间。
+
+    调用方负责保证每个区间 start < end；相接（a.end == b.start）也合并，
+    因为遮蔽语义下两者相邻处不存在未遮蔽时刻。
+    """
+    ordered = sorted(intervals, key=lambda iv: (iv[0], iv[1]))
+    merged: list[list[datetime]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        elif end > merged[-1][1]:
+            merged[-1][1] = end
+    return [(s, e) for s, e in merged]
+
+
+def _apply_faults(
+    segments: Sequence[Segment],
+    faults: Sequence[tuple[datetime, datetime]],
+) -> list[Segment]:
+    """用有效故障时段并集遮蔽原始区段：与故障相交的部分一律记为未知。
+
+    - 遮蔽部分无论原来有无读数、原状态如何，都改为 unknown（故障边界切断
+      连续超限累计——遮蔽段不是 exceeded）；
+    - 未遮蔽部分沿用原区段（采样保持 / 采样间隔未知 / 边界空白未知）。
+    逐区段与各故障求交后按时间顺序重新拼接，交由后续 _merge_adjacent
+    按状态合并（相邻 unknown 无论来源均合并）。
+    """
+    union = union_intervals(faults)
+    if not union:
+        return list(segments)
+
+    out: list[Segment] = []
+    for seg in segments:
+        cursor = seg.start
+        for f_start, f_end in union:
+            ov_start = max(cursor, f_start)
+            ov_end = min(seg.end, f_end)
+            if ov_start < ov_end:
+                # 故障开始前的未遮蔽尾部：沿用原状态
+                if cursor < ov_start:
+                    out.append(Segment(cursor, ov_start, seg.status, seg.unknown_reason))
+                out.append(Segment(ov_start, ov_end, "unknown", UNKNOWN_FAULT))
+                cursor = ov_end
+        if cursor < seg.end:
+            out.append(Segment(cursor, seg.end, seg.status, seg.unknown_reason))
+    return out
+
+
 def _max_continuous_exceeded(segments: Sequence[Segment]) -> float:
     """最长连续超限时长：相邻 exceeded 区段时长之和，被其它状态打断则重新累计。"""
     longest = 0.0
@@ -119,11 +177,16 @@ def evaluate(
     max_exceed_seconds: float,
     max_sample_interval: float,
     readings: Sequence[tuple[datetime, float] | dict[str, Any]],
+    faults: Sequence[tuple[datetime, datetime] | dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """执行审定计算。
 
     readings: 已排序的 (timestamp, temperature) 序列，或含
               timestamp/temperature 键的 dict 序列。
+    faults:   有效仪器失准故障时段（半开 [start, end)）序列，元素为
+              (start, end) 或含 start/end 键的 dict；取并集后遮蔽——
+              遮蔽部分无论有无读数均为未知，故障边界切断连续超限累计，
+              未遮蔽部分沿用采样保持与间隔规则。
     返回包含 normal/exceeded/unknown 区段、最长连续超限时长与结论的 dict。
     """
     normalized: list[tuple[datetime, float]] = []
@@ -134,11 +197,19 @@ def evaluate(
             normalized.append((item[0], float(item[1])))
     normalized.sort(key=lambda x: x[0])
 
+    fault_intervals: list[tuple[datetime, datetime]] = []
+    for item in faults or ():
+        if isinstance(item, dict):
+            fault_intervals.append((item["start"], item["end"]))
+        else:
+            fault_intervals.append((item[0], item[1]))
+
     raw = _build_raw_segments(
         window_start, window_end, normalized,
         max_sample_interval, temp_min, temp_max,
     )
-    segments = _merge_adjacent(raw)
+    masked = _apply_faults(raw, fault_intervals)
+    segments = _merge_adjacent(masked)
 
     normal = [s for s in segments if s.status == "normal"]
     exceeded = [s for s in segments if s.status == "exceeded"]

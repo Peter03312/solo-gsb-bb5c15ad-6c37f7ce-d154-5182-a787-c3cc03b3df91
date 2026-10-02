@@ -135,6 +135,29 @@ CREATE TABLE IF NOT EXISTS handover_order_items (
 
 CREATE INDEX IF NOT EXISTS idx_handover_order_items_order
     ON handover_order_items(order_id, seq);
+
+-- 仪器失准故障时段：馆员确认采样仪器在某审定窗口内失准后，凭窗口内唯一
+-- 故障标识 + 非空原因 + 带时区起止半开区间 [start_at, end_at) 登记。
+-- 有效（active）故障时段取并集遮蔽审定时间线：遮蔽部分无论有无读数均为
+-- 未知，并在故障边界切断连续超限；可凭标识 + 非空原因撤回（withdrawn），
+-- 撤回留存撤回原因与时间；同标识同内容重放幂等、异内容 409，
+-- 重复撤回同因幂等、异因 409。
+CREATE TABLE IF NOT EXISTS instrument_faults (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    fault_id TEXT NOT NULL,                  -- 故障标识（窗口内唯一）
+    start_at TEXT NOT NULL,                  -- 半开区间起点（含），ISO-8601 UTC
+    end_at TEXT NOT NULL,                    -- 半开区间终点（不含），ISO-8601 UTC
+    reason TEXT NOT NULL,                    -- 登记原因（非空）
+    status TEXT NOT NULL DEFAULT 'active',   -- active | withdrawn
+    registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    withdrawn_reason TEXT,                   -- 撤回原因（仅 withdrawn 行）
+    withdrawn_at TEXT,                       -- 撤回操作时间（仅 withdrawn 行）
+    UNIQUE(window_id, fault_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instrument_faults_window
+    ON instrument_faults(window_id, status);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
