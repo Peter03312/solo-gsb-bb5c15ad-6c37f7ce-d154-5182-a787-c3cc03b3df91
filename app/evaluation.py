@@ -9,6 +9,9 @@
   记为未知。读数提交的窗口为闭区间 [start, end]：终点时刻读数仅作为
   “覆盖终止采样”，自身区段时长为 0。因此首读恰在起点、末读恰在终点、
   间隔均合法且温度全部正常时，可得到无未知区段的合格结论。
+- 馆员登记的有效仪器故障时段（半开区间 [start, end)）取并集后遮蔽
+  时间线：被遮蔽的部分无论有无读数一律记为未知；故障边界会切断连续
+  超限（遮蔽段与正常/未知段一样打断连续超限累计）。
 
 判定：
 - 最长连续超限时长“超过”限值 -> 不合格（fail）；刚好等于限值不算超过。
@@ -22,6 +25,51 @@ from datetime import datetime
 from typing import Any, Iterable, Sequence
 
 from .models import Verdict
+from .timeutils import to_iso
+
+
+@dataclass(frozen=True)
+class Interval:
+    """半开时间区间 [start, end)。"""
+
+    start: datetime
+    end: datetime
+
+    def duration(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+
+def union_intervals(
+    intervals: Sequence[tuple[datetime, datetime] | Any],
+    clip_start: datetime | None = None,
+    clip_end: datetime | None = None,
+) -> list[Interval]:
+    """把半开区间取并集，返回互不重叠、按起点升序的 Interval 列表。
+
+    区间先按 [clip_start, clip_end] 裁剪（半开口径：起点被夹到不早于
+    clip_start，终点被夹到不晚于 clip_end），空区间丢弃；相接或重叠的
+    区间合并（半开区间首尾相接也合并：[a,b)+[b,c)=[a,c)）。
+    入参可以是 (start, end) 二元组，也可以是带 .start/.end 的对象。
+    """
+    norm: list[tuple[datetime, datetime]] = []
+    for item in intervals:
+        s, e = (item.start, item.end) if hasattr(item, "start") else (item[0], item[1])
+        if clip_start is not None and s < clip_start:
+            s = clip_start
+        if clip_end is not None and e > clip_end:
+            e = clip_end
+        if s < e:
+            norm.append((s, e))
+    norm.sort(key=lambda x: (x[0], x[1]))
+
+    merged: list[Interval] = []
+    for s, e in norm:
+        if merged and s <= merged[-1].end:
+            if e > merged[-1].end:
+                merged[-1] = Interval(merged[-1].start, e)
+        else:
+            merged.append(Interval(s, e))
+    return merged
 
 
 @dataclass(frozen=True)
@@ -42,6 +90,52 @@ class Segment:
             "status": self.status,
             "duration_seconds": round(self.duration(), 3),
         }
+
+
+def _mask_segments_with_faults(
+    segments: Sequence[Segment],
+    fault_union: Sequence[Interval],
+) -> list[Segment]:
+    """用有效故障时段的并集遮蔽原始区段。
+
+    取原始区段边界与故障并集边界的所有切点再切分；被任一故障半开区间
+    覆盖的原子段记为 unknown（无论原状态、无论有无读数），未遮蔽部分
+    沿用原状态。故障边界由此切断相邻的超限区段。
+    """
+    if not fault_union:
+        return list(segments)
+
+    cuts: set[datetime] = set()
+    for seg in segments:
+        cuts.add(seg.start)
+        cuts.add(seg.end)
+    for f in fault_union:
+        cuts.add(f.start)
+        cuts.add(f.end)
+    boundaries = sorted(cuts)
+
+    def _covered(t: datetime) -> bool:
+        for f in fault_union:
+            if f.start <= t < f.end:
+                return True
+            if t < f.start:
+                break
+        return False
+
+    out: list[Segment] = []
+    for seg in segments:
+        for a, b in zip(boundaries, boundaries[1:]):
+            if b <= seg.start:
+                continue
+            if a >= seg.end:
+                break
+            a2 = max(a, seg.start)
+            b2 = min(b, seg.end)
+            if a2 >= b2:
+                continue
+            status = "unknown" if _covered(a2) else seg.status
+            out.append(Segment(a2, b2, status))
+    return out
 
 
 def _build_raw_segments(
@@ -119,11 +213,16 @@ def evaluate(
     max_exceed_seconds: float,
     max_sample_interval: float,
     readings: Sequence[tuple[datetime, float] | dict[str, Any]],
+    fault_periods: Sequence[tuple[datetime, datetime] | Any] | None = None,
 ) -> dict[str, Any]:
     """执行审定计算。
 
     readings: 已排序的 (timestamp, temperature) 序列，或含
               timestamp/temperature 键的 dict 序列。
+    fault_periods: 有效（未撤回）仪器故障半开时段序列，元素为
+              (start, end) 二元组或带 .start/.end 的对象；先取并集
+              （裁剪到窗口内），被遮蔽部分一律记为未知，故障边界切断
+              连续超限。None 或空表示无故障遮蔽。
     返回包含 normal/exceeded/unknown 区段、最长连续超限时长与结论的 dict。
     """
     normalized: list[tuple[datetime, float]] = []
@@ -138,7 +237,11 @@ def evaluate(
         window_start, window_end, normalized,
         max_sample_interval, temp_min, temp_max,
     )
-    segments = _merge_adjacent(raw)
+    fault_union = union_intervals(
+        list(fault_periods or []), clip_start=window_start, clip_end=window_end
+    )
+    masked = _mask_segments_with_faults(raw, fault_union)
+    segments = _merge_adjacent(masked)
 
     normal = [s for s in segments if s.status == "normal"]
     exceeded = [s for s in segments if s.status == "exceeded"]
@@ -166,4 +269,14 @@ def evaluate(
         "has_exceeded": has_exceeded,
         "has_unknown": has_unknown,
         "reading_count": len(normalized),
+        # 参与本次审定的有效故障时段并集（裁剪到窗口内、相邻重叠已合并，
+        # 半开 [start,end)）；无故障时为空列表
+        "fault_periods": [
+            {
+                "start": to_iso(f.start),
+                "end": to_iso(f.end),
+                "duration_seconds": round(f.duration(), 3),
+            }
+            for f in fault_union
+        ],
     }

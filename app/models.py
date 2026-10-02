@@ -32,6 +32,15 @@ READING_SUPERSEDED = "superseded"
 # 留存期间该 ID 没有活动读数；更高修订号提交可恢复
 READING_VOIDED = "voided"
 
+# 仪器故障时段：馆员确认仪器失准后按窗口登记（带标识、非空原因、带时区的
+# 半开起止时间 [start, end)），可凭标识 + 非空原因撤回。有效（未撤回）
+# 故障时段取并集后遮蔽审定时间线：被遮蔽部分无论有无读数一律记为未知。
+FAULT_ACTIVE = "active"
+FAULT_WITHDRAWN = "withdrawn"
+# 未知区段来源之一：仪器失准（区别于采样间隔超限 sample_gap、边界空白
+# boundary_gap）；仅用于带证据的区段/报告输出，审定区段状态仍为 unknown。
+UNKNOWN_INSTRUMENT_FAULT = "instrument_fault"
+
 # 移交单有效状态：登记成功时必为有效；查询时按同一已提交状态核对引用证书，
 # 任一被撤销或其窗口已有更新版本 -> 整单失效。撤销不可回退、版本只增不减，
 # 失效一旦成立即不可逆（后续再签发也不恢复原单）。

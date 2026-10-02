@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.evaluation import evaluate
+from app.evaluation import evaluate, union_intervals
 
 WS = datetime(2026, 10, 1, 0, 0, 0, tzinfo=timezone.utc)
 WE = WS + timedelta(hours=1)
@@ -135,6 +135,78 @@ def test_unsorted_input_sorted_by_algorithm():
     r2 = evaluate(WS, WE, 18, 22, 300, 600,
                   [(ts(2), 20.0), (ts(0), 20.0), (ts(1), 23.0)])
     assert r1["exceeded_segments"] == r2["exceeded_segments"]
+
+
+# ------------------------------------------------------------ 仪器故障时段遮蔽
+
+def test_union_intervals_merge_overlap_touch_and_clip():
+    # 相接合并（半开 [a,b)+[b,c)）、重叠合并；裁剪到窗口；空/越界丢弃
+    out = union_intervals(
+        [(ts(10), ts(20)), (ts(20), ts(30)), (ts(25), ts(40)),
+         (ts(-5), ts(1)), (ts(59), ts(70)), (ts(45), ts(45))],
+        clip_start=WS, clip_end=WE)
+    got = [(s.start, s.end) for s in out]
+    assert got == [(WS, ts(1)), (ts(10), ts(40)), (ts(59), WE)]
+
+
+def test_fault_mask_unknown_even_with_readings():
+    # 全程正常覆盖本应 pass；故障遮蔽一段 -> 该段未知，其余正常
+    readings = [(WS + timedelta(seconds=60 * m), 20.0) for m in range(61)]
+    r = evaluate(WS, WE, 18, 22, 300, 600, readings,
+                 fault_periods=[(ts(10), ts(20))])
+    assert r["verdict"] == "pending"
+    assert r["unknown_segments"] == [{
+        "start": ts(10).isoformat().replace("+00:00", "Z"),
+        "end": ts(20).isoformat().replace("+00:00", "Z"),
+        "status": "unknown", "duration_seconds": 600.0}]
+    assert sum(s["duration_seconds"] for s in r["normal_segments"]) == 3000.0
+    # 读数仍计数（遮蔽不改读数本身）
+    assert r["reading_count"] == 61
+    assert r["fault_periods"][0]["duration_seconds"] == 600.0
+
+
+def test_fault_boundary_cuts_continuous_exceedance():
+    # 全程超限 3600s -> fail；遮蔽 [5,10) 后切成 300s 与 3000s
+    readings = [(WS + timedelta(seconds=60 * m), 23.0) for m in range(61)]
+    r = evaluate(WS, WE, 18, 22, 300, 600, readings,
+                 fault_periods=[(ts(5), ts(10))])
+    assert r["max_continuous_exceeded_seconds"] == 3000.0
+    assert r["verdict"] == "fail"
+    assert sum(s["duration_seconds"] for s in r["exceeded_segments"]) == 3300.0
+
+
+def test_fault_mask_down_to_limit_is_pending():
+    # 遮蔽后最长连续超限恰好 300（不严格超过限值），有未知 -> pending
+    readings = [(WS + timedelta(seconds=60 * m), 23.0) for m in range(61)]
+    r = evaluate(WS, WE, 18, 22, 300, 600, readings,
+                 fault_periods=[(ts(5), WE)])  # [00:05,01:00)
+    assert r["max_continuous_exceeded_seconds"] == 300.0
+    assert r["verdict"] == "pending"
+
+
+def test_overlapping_faults_union_single_unknown_segment():
+    readings = [(WS + timedelta(seconds=60 * m), 20.0) for m in range(61)]
+    r = evaluate(WS, WE, 18, 22, 300, 600, readings,
+                 fault_periods=[(ts(5), ts(12)), (ts(10), ts(20)),
+                                (ts(19), ts(25))])
+    assert len(r["unknown_segments"]) == 1
+    assert r["unknown_segments"][0]["duration_seconds"] == 1200.0  # [5,25)
+    assert len(r["fault_periods"]) == 1
+
+
+def test_fault_half_open_endpoint_does_not_mask_end_point():
+    # 故障 [00:10,00:20) 半开：恰在 00:20 结束，00:20 开始的区段不被遮蔽
+    readings = [(ts(0), 23.0), (ts(10), 23.0), (ts(20), 20.0),
+                (ts(30), 20.0)]
+    r = evaluate(WS, WE, 18, 22, 300, 600, readings,
+                 fault_periods=[(ts(10), ts(20))])
+    # [0,10) exceeded；[10,20) masked unknown；[20,30) normal；
+    # [30,60) 边界未知
+    assert r["unknown_segments"][0] == {
+        "start": ts(10).isoformat().replace("+00:00", "Z"),
+        "end": ts(20).isoformat().replace("+00:00", "Z"),
+        "status": "unknown", "duration_seconds": 600.0}
+    assert sum(s["duration_seconds"] for s in r["normal_segments"]) == 600.0
 
 
 if __name__ == "__main__":

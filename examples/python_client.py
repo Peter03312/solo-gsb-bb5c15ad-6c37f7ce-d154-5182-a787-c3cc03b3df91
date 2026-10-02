@@ -128,6 +128,31 @@ def get_handover(no):
     return call("GET", f"/api/v1/handover-orders/{no}")
 
 
+def _hhmm(minute: int) -> str:
+    """分钟偏移（可跨小时）-> 当天 UTC HH:MM。"""
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def register_fault(wid, fid, s_min, e_min, reason, *, date="2026-10-01"):
+    return call("POST", f"/api/v1/windows/{wid}/fault-periods", {
+        "fault_id": fid,
+        "start_at": f"{date}T{_hhmm(s_min)}:00Z",
+        "end_at": f"{date}T{_hhmm(e_min)}:00Z",
+        "reason": reason,
+    })
+
+
+def withdraw_fault(wid, fid, reason):
+    return call("POST",
+                f"/api/v1/windows/{wid}/fault-periods/{fid}/withdrawal",
+                {"reason": reason})
+
+
+def list_faults(wid, active_only=False):
+    q = "?active_only=true" if active_only else ""
+    return call("GET", f"/api/v1/windows/{wid}/fault-periods{q}")
+
+
 def item(rid, rev, minute, temp):
     return {"reading_id": rid, "revision": rev,
             "measured_at": f"2026-10-01T00:{minute:02d}:00Z",
@@ -507,7 +532,104 @@ def main() -> None:
     old1 = call("GET", f"/api/v1/certificates/{x1['id']}")[1]
     assert old1["version"] == 1 and old1["revoked"] is True
 
-    print("\n全部示例执行完成 ✔")
+    print("\n主流程示例执行完成 ✔")
+
+
+def fault_period_demo() -> None:
+    """仪器失准故障时段：登记/幂等/冲突/撤回，遮蔽重算，跨证报告还原。"""
+    show("仪器失准故障时段：登记与撤回（半开时段、并集遮蔽、立即重算）")
+    # 间隔上限 1800s：三条读数 [00:00]23 超限 -> [00:30]20 正常 -> [01:00]23
+    _, w = call("POST", "/api/v1/windows", {
+        "name": "展柜F-仪器故障",
+        "start_at": "2026-10-01T00:00:00Z",
+        "end_at": "2026-10-01T01:00:00Z",
+        "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+        "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 1800,
+    })
+    fw = w["id"]
+    assert submit(fw, "a", 1, 0, 23.0)[0] == 201
+    assert submit(fw, "b", 1, 30, 20.0)[0] == 201
+    # 窗口终点读数（覆盖终止采样）：直接给完整 ISO（01:00）
+    assert call("POST", f"/api/v1/windows/{fw}/readings",
+                {"reading_id": "c", "revision": 1,
+                 "measured_at": "2026-10-01T01:00:00Z",
+                 "temperature": 23.0})[0] == 201
+    ev0 = call("GET", f"/api/v1/windows/{fw}/evaluation")[1]
+    print("无故障审定:", ev0["verdict"],
+          "最长连续超限", ev0["max_continuous_exceeded_seconds"], "s")
+    assert ev0["verdict"] == "fail"
+
+    # 登记 [00:10,00:20)：遮蔽段无论有无读数均未知，1800s 超限被切成 600+600
+    code, r = register_fault(fw, "fault-01", 10, 20, "温感漂移：该时段读数不可信")
+    ev = r["current_evaluation"]
+    print("登记故障:", r["effect"], ev["verdict"],
+          "最长连续超限", ev["max_continuous_exceeded_seconds"], "s；",
+          "未知区间", [(u["start"][11:16], u["end"][11:16])
+                      for u in ev["unknown_segments"]])
+    assert code == 201 and r["effect"] == "registered"
+    assert [(u["start"][11:16], u["end"][11:16]) for u in ev["unknown_segments"]] == \
+        [("00:10", "00:20")]
+
+    # 同标识同内容重放幂等；异内容 409；非法时段/空原因 422
+    assert register_fault(fw, "fault-01", 10, 20,
+                          "温感漂移：该时段读数不可信")[1]["effect"] == "idempotent"
+    assert register_fault(fw, "fault-01", 10, 21,
+                          "温感漂移：该时段读数不可信")[0] == 409
+    assert register_fault(fw, "fault-x", 20, 10, "倒置")[0] == 422
+    assert register_fault(fw, "fault-x", 59, 61, "越界")[0] == 422
+    assert register_fault(fw, "fault-x", 10, 20, "   ")[0] == 422
+    assert call("POST", "/api/v1/windows/99999/fault-periods",
+                {"fault_id": "z", "start_at": "2026-10-01T00:00:00Z",
+                 "end_at": "2026-10-01T00:01:00Z", "reason": "x"})[0] == 404
+
+    # 故障期间签发：快照固化有效故障时段
+    fc1 = call("POST", f"/api/v1/windows/{fw}/certificates/issue",
+               {"note": "故障遮蔽中"})[1]
+    print("故障中签发 v", fc1["version"], fc1["verdict"],
+          "快照故障:", [f["fault_id"] for f in fc1["snapshot"]["fault_periods"]])
+    assert fc1["verdict"] == "fail"  # 遮蔽后两侧仍各有 600s > 300
+    assert [f["fault_id"] for f in fc1["snapshot"]["fault_periods"]] == ["fault-01"]
+
+    # 撤回：立即重算；同因幂等、异因 409、未知标识 404、空因 422
+    code, r = withdraw_fault(fw, "fault-01", "复核：仪器已校准恢复")
+    print("撤回:", r["effect"], r["fault_period"]["status"],
+          "-> 审定", r["current_evaluation"]["verdict"])
+    assert code == 201 and r["effect"] == "withdrawn"
+    assert r["current_evaluation"]["verdict"] == "fail"
+    rec = r["fault_period"]
+    assert withdraw_fault(fw, "fault-01", "复核：仪器已校准恢复")[1]["effect"] == \
+        "idempotent"
+    assert withdraw_fault(fw, "fault-01", "换个原因")[0] == 409
+    assert withdraw_fault(fw, "nope", "未知标识")[0] == 404
+    assert withdraw_fault(fw, "fault-01", "  ")[0] == 422
+    # 已撤回标识为终态：不能再次登记
+    assert register_fault(fw, "fault-01", 10, 20,
+                          "温感漂移：该时段读数不可信")[0] == 409
+    all_rows = list_faults(fw)[1]
+    active_rows = list_faults(fw, active_only=True)[1]
+    print("故障登记:", [(f["fault_id"], f["status"]) for f in all_rows],
+          "；当前有效:", active_rows)
+    assert [(f["status"]) for f in all_rows] == ["withdrawn"] and active_rows == []
+
+    # 撤回后再签 v2；跨证报告从各自快照还原故障造成的时间线变化
+    fc2 = call("POST", f"/api/v1/windows/{fw}/certificates/issue",
+               {"note": "撤回后重签"})[1]
+    rep = call("GET", "/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={fc1['id']}&new_certificate_id={fc2['id']}")[1]
+    print("跨证报告: 故障移除", rep["fault_periods_diff"]["removed_count"],
+          "段；时间线变化",
+          [(c["start"][11:16], c["before"]["status"], "->", c["after"]["status"])
+           for c in rep["timeline"]["changes"]])
+    assert rep["fault_periods_diff"]["removed_count"] == 1
+    ch = rep["timeline"]["changes"]
+    assert len(ch) == 1 and ch[0]["before"]["status"] == "unknown"
+    assert ch[0]["before"]["evidence"] == {
+        "unknown_reason": "instrument_fault", "fault_ids": ["fault-01"]}
+    assert ch[0]["after"]["status"] == "exceeded"
+    assert "仪器故障时段差异" in rep["summary"]["conclusion_zh"]
+    # 旧证快照不受撤回影响
+    old = call("GET", f"/api/v1/certificates/{fc1['id']}")[1]
+    assert [f["fault_id"] for f in old["snapshot"]["fault_periods"]] == ["fault-01"]
 
 
 def handover_demo() -> None:
@@ -592,4 +714,6 @@ def handover_demo() -> None:
 
 if __name__ == "__main__":
     main()
+    fault_period_demo()
     handover_demo()
+    print("\n全部示例执行完成 ✔")

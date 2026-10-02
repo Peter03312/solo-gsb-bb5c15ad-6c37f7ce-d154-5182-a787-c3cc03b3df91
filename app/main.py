@@ -15,6 +15,11 @@ from .schemas import (
     CertificateRevokeResponse,
     CertificateRevokeSubmit,
     EvaluationOut,
+    FaultPeriodOut,
+    FaultPeriodResponse,
+    FaultPeriodSubmit,
+    FaultWithdrawResponse,
+    FaultWithdrawSubmit,
     HandoverOrderOut,
     HandoverOrderSubmit,
     HandoverOrderSubmitResponse,
@@ -49,16 +54,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
         "支持读数修订、幂等提交（单条与批量补传）、误采作废与恢复、"
         "窗口规则版本化修订（初始规则为第 1 版，连续修订号 + 非空原因）、"
+        "仪器失准故障时段登记与撤回（半开时段须完全落在窗口内；有效时段"
+        "取并集遮蔽，遮蔽部分无论有无读数均为未知，故障边界切断连续超限，"
+        "同标识同内容重放幂等、异内容冲突，撤回同因幂等、异因冲突）、"
         "证书版本化签发与已签发证书撤销（凭非空原因，只改有效性、快照不变；"
         "仅最新签发版本未撤销时窗口有当前可用证书），"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
-        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）；"
+        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值；"
+        "跨证故障时段变化从各自快照还原时间线，旧快照缺字段视为空）；"
         "馆员办理展柜移交时凭非空移交单号与非空窗口标识列表申请放行："
         "逐窗口核对当前可用证书且结论合格才一次登记（固化证书标识/版本/结论），"
         "查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效"
@@ -271,6 +280,87 @@ def list_reading_revisions(
     """该读数 ID 的全部修订历史（含作废记录），按修订号升序。"""
     services.get_window_row(conn, window_id)
     return services.list_reading_revisions(conn, window_id, reading_id)
+
+
+# ------------------------------------------------------------ 仪器故障时段
+
+@app.post(
+    "/api/v1/windows/{window_id}/fault-periods",
+    response_model=FaultPeriodResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["fault-periods"],
+)
+def register_fault_period(
+    window_id: int,
+    payload: FaultPeriodSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员确认仪器失准：按窗口登记一个带标识的故障时段。
+
+    - 时段为半开区间 [start_at, end_at)，时间须带时区、起点严格早于终点，
+      且完全落在窗口内（两端含窗口边界）；原因非空。登记后在同一事务内
+      按原结论优先级立即重算：有效故障时段取并集，遮蔽部分无论有无读数
+      一律为未知，故障边界切断连续超限。
+    - 同标识且起止/原因完全一致重放 -> effect=idempotent（不产生新记录）；
+      同标识异内容 -> 409；已撤回标识再登记 -> 409；
+    - 窗口不存在 -> 404；非法时段或缺时区、空原因 -> 422，拒收不改状态。
+    """
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effect, fault = services.register_fault_period(conn, window_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effect": effect, "fault_period": fault,
+                "current_evaluation": evaluation}
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/fault-periods",
+    response_model=list[FaultPeriodOut],
+    tags=["fault-periods"],
+)
+def list_fault_periods(
+    window_id: int,
+    active_only: bool = Query(False, description="仅返回当前有效（未撤回）时段"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> list[dict[str, Any]]:
+    """该窗口全部仪器故障时段登记（含撤回状态，按登记顺序升序）。
+
+    active_only=true 时仅返回当前有效（未撤回）时段（按起点升序）。
+    """
+    services.get_window_row(conn, window_id)
+    rows = (services.list_active_fault_period_rows(conn, window_id)
+            if active_only else services.list_fault_period_rows(conn, window_id))
+    return [services.fault_period_to_dict(r) for r in rows]
+
+
+@app.post(
+    "/api/v1/windows/{window_id}/fault-periods/{fault_id}/withdrawal",
+    response_model=FaultWithdrawResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["fault-periods"],
+)
+def withdraw_fault_period(
+    window_id: int,
+    fault_id: str,
+    payload: FaultWithdrawSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员撤回一个已登记的仪器故障时段（凭路径标识 + 非空撤回原因）。
+
+    - 撤回只置状态（撤回原因/时间固化，登记内容保留），撤回后该时段立即
+      不再遮蔽，并在同一事务内按原结论优先级立即重算；
+    - 相同原因重复撤回 -> effect=idempotent，返回原撤回记录（时间不变）；
+      已撤回但原因不同 -> 409；
+    - 标识在该窗口从未登记（未知标识）-> 404；窗口不存在 -> 404；
+    - 原因为空或只含空白 -> 422。
+    """
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effect, fault = services.withdraw_fault_period(
+            conn, window_id, fault_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effect": effect, "fault_period": fault,
+                "current_evaluation": evaluation}
 
 
 # ---------------------------------------------------------------- 签发

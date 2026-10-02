@@ -5,14 +5,19 @@
 1. 读数级：按 reading_id 对齐两版快照，比较 revision / measured_at / temperature，
    列出新增、变更与移除（误采作废后再次签发的证书快照中该读数消失，计入
    removed；恢复后再次签发则计入 added）。
-2. 时间线级：用两版各自快照里的窗口参数与读数，重建“带证据”的原始半开
-   区段（采样保持、采样间隔超限未知、边界空白未知），再按两版全部区段
-   边界的并集切分，输出**状态发生变化**的原子半开区间，给出变化前后状态
-   及各侧对应读数证据（reading_id + revision）。未知侧必须说明来源：
+2. 仪器故障级：对齐两版快照各自固化的有效故障时段（旧快照缺 fault_periods
+   字段视为空），列出新增/移除/变更；有效故障时段取并集后遮蔽时间线。
+3. 时间线级：用两版各自快照里的窗口参数、读数与有效故障时段，重建“带证据”
+   的原始半开区段（采样保持、采样间隔超限未知、边界空白未知、仪器故障遮蔽
+   未知），再按两版全部区段边界的并集切分，输出**状态发生变化**的原子半开
+   区间，给出变化前后状态及各侧对应证据（已知区段为 reading_id + revision；
+   故障遮蔽为 instrument_fault + 覆盖该区间的故障标识列表；未知侧还须说明
+   来源）：
      - sample_gap：相邻读数间隔严格超过最大采样间隔（附间隔两侧读数）；
      - boundary_gap：边界空白，boundary_side=leading/trailing/empty
        （首读之前附右侧首条读数，末读之后附左侧末条读数，整窗无读数时
-       两侧均无读数）。
+       两侧均无读数）；
+     - instrument_fault：被有效故障时段并集遮蔽（附覆盖该区间的故障标识）。
    相邻且变化前后状态与证据完全相同的区间合并输出。
 """
 from __future__ import annotations
@@ -22,12 +27,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
-from .models import VERDICT_LABELS_ZH
+from .evaluation import Interval, union_intervals
+from .models import UNKNOWN_INSTRUMENT_FAULT, VERDICT_LABELS_ZH
 from .timeutils import parse_stored, to_iso
 
 # 未知原因
 UNKNOWN_SAMPLE_GAP = "sample_gap"      # 采样间隔超限
 UNKNOWN_BOUNDARY_GAP = "boundary_gap"  # 边界空白（首读前 / 末读后 / 整窗无读数）
+# instrument_fault 常量统一取自 app.models（UNKNOWN_INSTRUMENT_FAULT）
 
 # 边界空白方位
 BOUNDARY_LEADING = "leading"
@@ -69,7 +76,7 @@ class EvidenceSeg:
     end: datetime
     status: str  # normal | exceeded | unknown
 
-    # 未知来源：sample_gap / boundary_gap；已知区段为 None
+    # 未知来源：sample_gap / boundary_gap / instrument_fault；已知区段为 None
     unknown_reason: Optional[str] = None
     # boundary_gap 时的方位：leading / trailing / empty
     boundary_side: Optional[str] = None
@@ -84,8 +91,11 @@ class EvidenceSeg:
     right_reading_id: Optional[str] = None
     right_revision: Optional[int] = None
 
+    # instrument_fault：遮蔽该区段的有效故障时段标识（已排序，去重）
+    fault_ids: Optional[tuple[str, ...]] = None
+
     def evidence_key(self) -> tuple[Any, ...]:
-        """证据身份：状态 + 未知来源/方位 + 各侧读数 ID/修订号。"""
+        """证据身份：状态 + 未知来源/方位 + 各侧读数 ID/修订号 + 故障标识集。"""
         return (
             self.status,
             self.unknown_reason,
@@ -96,6 +106,7 @@ class EvidenceSeg:
             self.left_revision,
             self.right_reading_id,
             self.right_revision,
+            tuple(self.fault_ids) if self.fault_ids is not None else None,
         )
 
     def evidence(self) -> dict[str, Any]:
@@ -104,6 +115,10 @@ class EvidenceSeg:
             return {"reading_id": self.reading_id, "revision": self.revision}
 
         out: dict[str, Any] = {"unknown_reason": self.unknown_reason}
+        if self.unknown_reason == UNKNOWN_INSTRUMENT_FAULT:
+            # 仪器故障遮蔽：给出覆盖该区间的全部有效故障时段标识
+            out["fault_ids"] = list(self.fault_ids or ())
+            return out
         if self.unknown_reason == UNKNOWN_BOUNDARY_GAP:
             out["boundary_side"] = self.boundary_side
             if self.boundary_side == BOUNDARY_LEADING:
@@ -138,12 +153,108 @@ def _snapshot_readings(snap: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _snapshot_fault_periods(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """快照固化的有效仪器故障时段（旧快照缺字段视为空）。
+
+    只纳入快照中仍为有效（未撤回）的登记；证书签发时本就只固化有效时段，
+    这里对 status 再做一次防御性过滤。
+    """
+    out = []
+    for f in snap.get("fault_periods", []) or []:
+        if f.get("status", "active") == "active":
+            out.append(f)
+    out.sort(key=lambda f: (parse_stored(f["start_at"]), f.get("fault_id", "")))
+    return out
+
+
+def _mask_evidence_segments(
+    segs: list[EvidenceSeg],
+    fault_rows: list[dict[str, Any]],
+    win_start: datetime,
+    win_end: datetime,
+) -> list[EvidenceSeg]:
+    """用快照有效故障时段的并集遮蔽带证据区段。
+
+    与 app.evaluation 的审定遮蔽同一条切分规则：取原始区段边界与故障并集
+    边界的并集再切分；被任一故障半开区间覆盖的原子段记为 unknown
+    （unknown_reason=instrument_fault，附覆盖它的故障标识），未遮蔽部分
+    原样保留（含原证据）。故障边界据此切断连续超限。
+    """
+    intervals = [
+        Interval(parse_stored(f["start_at"]), parse_stored(f["end_at"]))
+        for f in fault_rows
+    ]
+    fault_union = union_intervals(intervals, clip_start=win_start, clip_end=win_end)
+    if not fault_union:
+        return segs
+
+    # 建立“并集区间 -> 覆盖它的原始故障标识集”：逐并集区间收集所有与之
+    # 相交的原始登记标识（重叠故障可能在同一点上同时遮蔽）。
+    union_fault_ids: list[tuple[str, ...]] = []
+    for fu in fault_union:
+        ids = sorted({
+            f.get("fault_id", "")
+            for f in fault_rows
+            if parse_stored(f["start_at"]) < fu.end and parse_stored(f["end_at"]) > fu.start
+        })
+        union_fault_ids.append(tuple(i for i in ids if i))
+
+    cuts: set[datetime] = {win_start, win_end}
+    for seg in segs:
+        cuts.add(seg.start)
+        cuts.add(seg.end)
+    for fu in fault_union:
+        cuts.add(fu.start)
+        cuts.add(fu.end)
+    boundaries = sorted(cuts)
+
+    def _covering(t: datetime) -> int:
+        """返回覆盖时刻 t 的并集区间下标；未被遮蔽返回 -1。"""
+        for i, fu in enumerate(fault_union):
+            if fu.start <= t < fu.end:
+                return i
+            if t < fu.start:
+                break
+        return -1
+
+    out: list[EvidenceSeg] = []
+    for seg in segs:
+        for a, b in zip(boundaries, boundaries[1:]):
+            if b <= seg.start:
+                continue
+            if a >= seg.end:
+                break
+            a2 = max(a, seg.start)
+            b2 = min(b, seg.end)
+            if a2 >= b2:
+                continue
+            idx = _covering(a2)
+            if idx >= 0:
+                out.append(EvidenceSeg(
+                    a2, b2, "unknown",
+                    unknown_reason=UNKNOWN_INSTRUMENT_FAULT,
+                    fault_ids=union_fault_ids[idx],
+                ))
+            else:
+                out.append(EvidenceSeg(a2, b2, seg.status,
+                                      unknown_reason=seg.unknown_reason,
+                                      boundary_side=seg.boundary_side,
+                                      reading_id=seg.reading_id,
+                                      revision=seg.revision,
+                                      left_reading_id=seg.left_reading_id,
+                                      left_revision=seg.left_revision,
+                                      right_reading_id=seg.right_reading_id,
+                                      right_revision=seg.right_revision,
+                                      fault_ids=seg.fault_ids))
+    return out
+
+
 def build_evidence_segments(snapshot: dict[str, Any]) -> list[EvidenceSeg]:
-    """按快照参数与读数重建带证据的原始半开区段。
+    """按快照参数、读数与有效故障时段重建带证据的原始半开区段。
 
     与 app.evaluation 的覆盖语义保持一致（采样保持、间隔严格超限未知、
-    边界空白未知），区别仅在于这里保留每段的读数身份证据，且不合并
-    （合并发生在两版对齐之后）。
+    边界空白未知、仪器故障遮蔽未知），区别仅在于这里保留每段的读数/故障
+    身份证据，且不合并（合并发生在两版对齐之后）。
     """
     win = _snapshot_window(snapshot)
     win_start = parse_stored(win["start_at"])
@@ -160,9 +271,11 @@ def build_evidence_segments(snapshot: dict[str, Any]) -> list[EvidenceSeg]:
 
     if not readings:
         # 整窗无有效读数：未知来自边界空白（既无首读也无末读）
-        return [EvidenceSeg(win_start, win_end, "unknown",
+        base = [EvidenceSeg(win_start, win_end, "unknown",
                             unknown_reason=UNKNOWN_BOUNDARY_GAP,
                             boundary_side=BOUNDARY_EMPTY)]
+        return _mask_evidence_segments(
+            base, _snapshot_fault_periods(snapshot), win_start, win_end)
 
     segs: list[EvidenceSeg] = []
     first_ts, _, first_rid, first_rev = readings[0]
@@ -198,7 +311,8 @@ def build_evidence_segments(snapshot: dict[str, Any]) -> list[EvidenceSeg]:
             left_reading_id=last_rid, left_revision=last_rev,
         ))
 
-    return segs
+    return _mask_evidence_segments(
+        segs, _snapshot_fault_periods(snapshot), win_start, win_end)
 
 
 # ------------------------------------------------------------ 时间线对齐
@@ -330,6 +444,57 @@ def diff_readings(old_snap: dict[str, Any],
     }
 
 
+# ------------------------------------------------------------ 仪器故障时段差异
+
+_FAULT_FIELD_ORDER = ("start_at", "end_at", "reason")
+
+
+def _fault_key(f: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fault_id": f["fault_id"],
+        "start_at": to_iso(parse_stored(f["start_at"])),
+        "end_at": to_iso(parse_stored(f["end_at"])),
+        "reason": f["reason"],
+    }
+
+
+def diff_fault_periods(old_snap: dict[str, Any],
+                       new_snap: dict[str, Any]) -> dict[str, Any]:
+    """比较两版快照固化的有效仪器故障时段：新增 / 移除 / 变更。
+
+    按 fault_id 对齐；旧快照缺 fault_periods 字段视为空。只比较签发时
+    有效（未撤回）的登记，故撤回一个故障时段后再次签发体现为 removed，
+    新登记体现为 added；时间按时刻比较，时区表示不同不视为变化。
+    """
+    old_map = {f["fault_id"]: _fault_key(f) for f in _snapshot_fault_periods(old_snap)}
+    new_map = {f["fault_id"]: _fault_key(f) for f in _snapshot_fault_periods(new_snap)}
+
+    added, removed, changed = [], [], []
+    for fid in sorted(new_map.keys() - old_map.keys()):
+        added.append(new_map[fid])
+    for fid in sorted(old_map.keys() - new_map.keys()):
+        removed.append(old_map[fid])
+    for fid in sorted(old_map.keys() & new_map.keys()):
+        before, after = old_map[fid], new_map[fid]
+        changed_fields = [f for f in _FAULT_FIELD_ORDER if before[f] != after[f]]
+        if changed_fields:
+            changed.append({
+                "fault_id": fid,
+                "before": before,
+                "after": after,
+                "changed_fields": changed_fields,
+            })
+
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "added_count": len(added),
+        "removed_count": len(removed),
+        "changed_count": len(changed),
+    }
+
+
 # ------------------------------------------------------------ 规则差异
 
 def _snapshot_rule_revision(snap: dict[str, Any]) -> int:
@@ -388,7 +553,8 @@ def _verdict_direction(old_v: str, new_v: str) -> str:
 def _build_summary(old_cert: dict[str, Any], new_cert: dict[str, Any],
                    reading_diff: dict[str, Any],
                    changes: Sequence[dict[str, Any]],
-                   rule_diff: dict[str, Any]) -> dict[str, Any]:
+                   rule_diff: dict[str, Any],
+                   fault_diff: dict[str, Any] | None = None) -> dict[str, Any]:
     old_ev = old_cert["snapshot"]["evaluation"]
     new_ev = new_cert["snapshot"]["evaluation"]
     old_v, new_v = old_cert["verdict"], new_cert["verdict"]
@@ -432,6 +598,13 @@ def _build_summary(old_cert: dict[str, Any], new_cert: dict[str, Any],
         f"变更 {reading_diff['changed_count']} 条、"
         f"移除 {reading_diff['removed_count']} 条（均以两张证书的不可变快照为据）。"
     )
+    if fault_diff is not None:
+        lines.append(
+            f"仪器故障时段差异：新增 {fault_diff['added_count']} 段、"
+            f"变更 {fault_diff['changed_count']} 段、"
+            f"撤回/移除 {fault_diff['removed_count']} 段"
+            "（故障遮蔽部分无论有无读数均为未知，并切断连续超限）。"
+        )
     if changes:
         lines.append(f"时间线共有 {len(changes)} 个半开区间状态发生变化（相邻同证据区间已合并）。")
     else:
@@ -464,8 +637,10 @@ def build_revision_report(old_cert: dict[str, Any],
     old_snap, new_snap = old_cert["snapshot"], new_cert["snapshot"]
     rule_diff = diff_rules(old_snap, new_snap)
     reading_diff = diff_readings(old_snap, new_snap)
+    fault_diff = diff_fault_periods(old_snap, new_snap)
     changes = align_timelines(old_snap, new_snap)
-    summary = _build_summary(old_cert, new_cert, reading_diff, changes, rule_diff)
+    summary = _build_summary(old_cert, new_cert, reading_diff, changes, rule_diff,
+                             fault_diff=fault_diff)
 
     win = dict(new_snap["window"])
 
@@ -489,6 +664,7 @@ def build_revision_report(old_cert: dict[str, Any],
         "new_certificate": cert_ref(new_cert),
         "rules_diff": rule_diff,
         "readings_diff": reading_diff,
+        "fault_periods_diff": fault_diff,
         "timeline": {
             "max_sample_interval_seconds": float(win["max_sample_interval_seconds"]),
             "changes": changes,

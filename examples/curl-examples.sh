@@ -259,6 +259,64 @@ NEW_RC=$(echo "$RC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['i
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_RC&new_certificate_id=$NEW_RC" \
   | python3 -c "import sys,json;d=json.load(sys.stdin);print('rules_diff:',d['rules_diff']['rule_revision_before'],'->',d['rules_diff']['rule_revision_after'],d['rules_diff']['changed_fields']);print('timeline_change_count:',d['timeline']['change_count']);print(d['summary']['conclusion_zh'])"
 
+echo "== 15b. 仪器失准故障时段登记与撤回（单独建窗口演示）=="
+FW=$(api POST /api/v1/windows '{
+  "name": "展柜F-仪器故障",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 1800
+}')
+FID=$(echo "$FW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 三条读数：[00:00]23 超限 -> [00:30]20 正常 -> [01:00]23（覆盖终止采样）
+api POST "/api/v1/windows/$FID/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":23.0}' >/dev/null
+api POST "/api/v1/windows/$FID/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:30:00Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$FID/readings" '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T01:00:00Z","temperature":23.0}' >/dev/null
+echo "-- 15b.1 无故障时：[00:00,00:30) 超限 1800s > 300 -> fail --"
+api GET "/api/v1/windows/$FID/evaluation" \
+  | python3 -c "import sys,json;e=json.load(sys.stdin);print(e['verdict'],e['max_continuous_exceeded_seconds'])"
+
+echo "-- 15b.2 登记故障 [00:10,00:20)：遮蔽段无论有无读数均未知，超限被切成 600s+600s --"
+api POST "/api/v1/windows/$FID/fault-periods" '{
+  "fault_id":"fault-01","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:20:00Z",
+  "reason":"温感漂移：该时段读数不可信"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);e=d['current_evaluation'];print(d['effect'],e['verdict'],'最长连续超限',e['max_continuous_exceeded_seconds'],'未知',[(u['start'][11:16],u['end'][11:16]) for u in e['unknown_segments']])"
+
+echo "-- 15b.3 同标识同内容重放 -> 幂等；同标识改终点 -> 409；非法时段/空原因 -> 422 --"
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-01","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:20:00Z","reason":"温感漂移：该时段读数不可信"}' \
+  | python3 -c "import sys,json;print('effect =',json.load(sys.stdin)['effect'])"
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-01","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:21:00Z","reason":"温感漂移：该时段读数不可信"}' || true
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-x","start_at":"2026-10-01T00:20:00Z","end_at":"2026-10-01T00:10:00Z","reason":"倒置"}' || true
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-x","start_at":"2026-10-01T00:59:00Z","end_at":"2026-10-01T01:01:00Z","reason":"越界"}' || true
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-x","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:20:00Z","reason":"  "}' || true
+
+echo "-- 15b.4 故障期间签发 v1：快照固化有效故障时段与遮蔽后结果（超限仍 >300 故 fail）--"
+FC1=$(api POST "/api/v1/windows/$FID/certificates/issue" '{"note":"故障遮蔽中"}')
+echo "$FC1" | python3 -c "import sys,json;c=json.load(sys.stdin);print('证书',c['id'],'version',c['version'],c['verdict'],'故障',[f['fault_id'] for f in c['snapshot']['fault_periods']])"
+
+echo "-- 15b.5 撤回故障（非空原因）-> 立即恢复 fail；同因重放幂等、异因 409、未知标识 404 --"
+api POST "/api/v1/windows/$FID/fault-periods/fault-01/withdrawal" '{"reason":"复核：仪器已校准恢复"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['effect'],d['fault_period']['status'],d['current_evaluation']['verdict'])"
+api POST "/api/v1/windows/$FID/fault-periods/fault-01/withdrawal" '{"reason":"复核：仪器已校准恢复"}' \
+  | python3 -c "import sys,json;print('effect =',json.load(sys.stdin)['effect'])"
+api POST "/api/v1/windows/$FID/fault-periods/fault-01/withdrawal" '{"reason":"换个原因"}' || true
+api POST "/api/v1/windows/$FID/fault-periods/nope/withdrawal" '{"reason":"未知标识"}' || true
+api POST "/api/v1/windows/$FID/fault-periods/fault-01/withdrawal" '{"reason":"   "}' || true
+
+echo "-- 15b.6 撤回后签发 v2；跨证报告从各自快照还原故障时间线（遮蔽段 unknown -> exceeded）--"
+FC2=$(api POST "/api/v1/windows/$FID/certificates/issue" '{"note":"撤回后重签"}')
+F_OLD=$(echo "$FC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+F_NEW=$(echo "$FC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$F_OLD&new_certificate_id=$F_NEW" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('fault_removed:',d['fault_periods_diff']['removed_count']);print('timeline:',[(c['start'][11:16],c['before']['status'],'->',c['after']['status']) for c in d['timeline']['changes']]);print(d['summary']['verdict_before'],'->',d['summary']['verdict_after'])"
+
+echo "-- 15b.7 已撤回标识不能再次登记 -> 409；列表仍保留撤回记录（active_only=true 为空）--"
+api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-01","start_at":"2026-10-01T00:10:00Z","end_at":"2026-10-01T00:20:00Z","reason":"温感漂移：该时段读数不可信"}' || true
+api GET "/api/v1/windows/$FID/fault-periods" | python3 -c "import sys,json;print([(f['fault_id'],f['status']) for f in json.load(sys.stdin)])"
+api GET "/api/v1/windows/$FID/fault-periods?active_only=true" | python3 -c "import sys,json;print('active:',json.load(sys.stdin))"
+
 echo "== 16. 已签发证书撤销（单独建窗口演示；撤销只改有效性，版本/结论/快照不动）=="
 VW=$(api POST /api/v1/windows '{
   "name": "展柜G-证书撤销",

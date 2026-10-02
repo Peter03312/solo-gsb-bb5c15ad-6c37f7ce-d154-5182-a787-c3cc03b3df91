@@ -9,6 +9,8 @@ from fastapi import HTTPException, status
 
 from .evaluation import evaluate
 from .models import (
+    FAULT_ACTIVE,
+    FAULT_WITHDRAWN,
     HANDOVER_INVALID,
     HANDOVER_STATUS_LABELS_ZH,
     HANDOVER_VALID,
@@ -19,6 +21,8 @@ from .models import (
 from .report import build_revision_report
 from .schemas import (
     CertificateRevokeSubmit,
+    FaultPeriodSubmit,
+    FaultWithdrawSubmit,
     HandoverOrderSubmit,
     ReadingBatchSubmit,
     ReadingSubmit,
@@ -664,13 +668,185 @@ def revision_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- 仪器故障时段
+
+def _get_fault_row(
+    conn: sqlite3.Connection, window_id: int, fault_id: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM fault_periods WHERE window_id=? AND fault_id=?",
+        (window_id, fault_id),
+    ).fetchone()
+
+
+def get_fault_row_or_404(
+    conn: sqlite3.Connection, window_id: int, fault_id: str
+) -> sqlite3.Row:
+    row = _get_fault_row(conn, window_id, fault_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"故障时段标识 {fault_id} 在窗口 {window_id} 中未找到（从未登记）",
+        )
+    return row
+
+
+def list_active_fault_period_rows(
+    conn: sqlite3.Connection, window_id: int
+) -> list[sqlite3.Row]:
+    """当前有效（未撤回）故障时段行，按起点、标识升序。"""
+    return conn.execute(
+        "SELECT * FROM fault_periods WHERE window_id=? AND status=? "
+        "ORDER BY start_at ASC, fault_id ASC",
+        (window_id, FAULT_ACTIVE),
+    ).fetchall()
+
+
+def list_fault_period_rows(
+    conn: sqlite3.Connection, window_id: int
+) -> list[sqlite3.Row]:
+    """该窗口全部故障时段登记（含已撤回），按登记顺序（id 升序）。"""
+    return conn.execute(
+        "SELECT * FROM fault_periods WHERE window_id=? ORDER BY id ASC",
+        (window_id,),
+    ).fetchall()
+
+
+def fault_period_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    duration = (
+        parse_stored(row["end_at"]) - parse_stored(row["start_at"])
+    ).total_seconds()
+    return {
+        "fault_id": row["fault_id"],
+        "start_at": row["start_at"],
+        "end_at": row["end_at"],
+        "duration_seconds": round(duration, 3),
+        "reason": row["reason"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "withdrawal": (
+            {"reason": row["withdrawn_reason"], "withdrawn_at": row["withdrawn_at"]}
+            if row["status"] == FAULT_WITHDRAWN else None
+        ),
+    }
+
+
+def register_fault_period(
+    conn: sqlite3.Connection, window_id: int, payload: FaultPeriodSubmit
+) -> tuple[str, dict[str, Any]]:
+    """登记仪器故障时段，返回 (effect, fault_period_dict)。调用方需已持有写事务。
+
+    半开区间 [start_at, end_at) 必须完全落在窗口闭区间 [win_start, win_end]
+    内（两端允许恰为窗口边界）且起点严格早于终点；原因非空由请求模型先拦截。
+    - 同标识且起止/原因完全一致重放 -> ("idempotent", 原记录)，不产生新行；
+    - 同标识但任一内容不同 -> 409；已撤回标识再次登记 -> 409（撤回为终态）；
+    - 非法时段 -> 422；窗口不存在 -> 404（先于内容校验）。
+    """
+    win = get_window_row(conn, window_id)
+    win_start = parse_stored(win["start_at"])
+    win_end = parse_stored(win["end_at"])
+
+    start = to_utc(payload.start_at)
+    end = to_utc(payload.end_at)
+    if start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"非法故障时段：起点 {to_iso(start)} 必须严格早于终点 "
+                f"{to_iso(end)}（半开区间 [start, end)）"
+            ),
+        )
+    # 须完全落在窗口内：窗口闭区间边界允许（半开输出口径与读数/区段一致）
+    if start < win_start or end > win_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"非法故障时段：[{to_iso(start)}, {to_iso(end)}) 必须完全落在窗口 "
+                f"[{to_iso(win_start)}, {to_iso(win_end)}] 内"
+            ),
+        )
+    start_iso, end_iso = to_iso(start), to_iso(end)
+
+    row = _get_fault_row(conn, window_id, payload.fault_id)
+    if row is not None:
+        if row["status"] == FAULT_WITHDRAWN:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障时段标识 {payload.fault_id} 已撤回（终态），不能以同一标识"
+                    "重新登记；请使用新的故障时段标识。"
+                ),
+            )
+        if (row["start_at"] != start_iso or row["end_at"] != end_iso
+                or row["reason"] != payload.reason):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障时段标识 {payload.fault_id} 已登记但内容冲突："
+                    f"已存（{row['start_at']} ~ {row['end_at']}，原因「{row['reason']}」），"
+                    f"本次（{start_iso} ~ {end_iso}，原因「{payload.reason}」）。"
+                    "相同标识重放必须起止时间与原因完全一致。"
+                ),
+            )
+        return "idempotent", fault_period_to_dict(row)
+
+    conn.execute(
+        """
+        INSERT INTO fault_periods (window_id, fault_id, start_at, end_at, reason, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (window_id, payload.fault_id, start_iso, end_iso, payload.reason, FAULT_ACTIVE),
+    )
+    row = _get_fault_row(conn, window_id, payload.fault_id)
+    return "registered", fault_period_to_dict(row)
+
+
+def withdraw_fault_period(
+    conn: sqlite3.Connection, window_id: int, fault_id: str, payload: FaultWithdrawSubmit
+) -> tuple[str, dict[str, Any]]:
+    """撤回仪器故障时段，返回 (effect, fault_period_dict)。调用方需已持有写事务。
+
+    - 标识在该窗口从未登记 -> 404；
+    - 已撤回且撤回原因相同 -> ("idempotent", 原记录)，撤回时间不变；
+    - 已撤回但原因不同 -> 409；撤回只置状态（原因/时间），登记内容保留。
+    """
+    # 先确认窗口存在，使“窗口不存在”与“标识未找到”语义可区分
+    get_window_row(conn, window_id)
+    row = get_fault_row_or_404(conn, window_id, fault_id)
+
+    if row["status"] == FAULT_WITHDRAWN:
+        if payload.reason != row["withdrawn_reason"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"故障时段标识 {fault_id} 已撤回且撤回原因冲突："
+                    f"已存「{row['withdrawn_reason']}」，本次「{payload.reason}」。"
+                    "重复撤回必须使用相同原因（相同原因重放为幂等，返回原记录）。"
+                ),
+            )
+        return "idempotent", fault_period_to_dict(row)
+
+    conn.execute(
+        "UPDATE fault_periods SET status=?, withdrawn_reason=?, "
+        "withdrawn_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+        "WHERE window_id=? AND fault_id=?",
+        (FAULT_WITHDRAWN, payload.reason, window_id, fault_id),
+    )
+    row = _get_fault_row(conn, window_id, fault_id)
+    return "withdrawn", fault_period_to_dict(row)
+
+
 # ---------------------------------------------------------------- 审定计算
 
 def compute_evaluation(conn: sqlite3.Connection, win: sqlite3.Row) -> dict[str, Any]:
-    """基于当前活动读数计算审定结果（不签发）。"""
+    """基于当前活动读数与有效（未撤回）故障时段计算审定结果（不签发）。"""
     reading_rows = list_active_readings(conn, win["id"])
     readings = [
         (parse_stored(r["measured_at"]), float(r["temperature"])) for r in reading_rows
+    ]
+    fault_rows = list_active_fault_period_rows(conn, win["id"])
+    fault_periods = [
+        (parse_stored(r["start_at"]), parse_stored(r["end_at"])) for r in fault_rows
     ]
     return evaluate(
         window_start=parse_stored(win["start_at"]),
@@ -680,6 +856,7 @@ def compute_evaluation(conn: sqlite3.Connection, win: sqlite3.Row) -> dict[str, 
         max_exceed_seconds=float(win["max_continuous_exceed_seconds"]),
         max_sample_interval=float(win["max_sample_interval_seconds"]),
         readings=readings,
+        fault_periods=fault_periods,
     )
 
 
@@ -721,6 +898,10 @@ def window_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     # 窗口当前可用证书完整内容（含撤销状态标示）；无则为 null
     current = get_current_certificate_row(conn, row["id"])
     data["current_certificate"] = certificate_to_dict(current) if current else None
+    # 当前有效（未撤回）仪器故障时段（按起点升序）
+    data["active_fault_periods"] = [
+        fault_period_to_dict(r) for r in list_active_fault_period_rows(conn, row["id"])
+    ]
     return data
 
 
@@ -948,6 +1129,9 @@ def issue_certificate(
     win = get_window_row(conn, window_id)
     evaluation = compute_evaluation(conn, win)
     reading_rows = list_active_readings(conn, window_id)
+    # 固化签发时的有效（未撤回）仪器故障时段（取并集遮蔽所用的原始登记；
+    # 跨证报告从各自快照还原故障造成的时间线变化）。已撤回时段不进快照。
+    fault_rows = list_active_fault_period_rows(conn, window_id)
 
     last = conn.execute(
         "SELECT MAX(version) AS v FROM certificates WHERE window_id=?", (window_id,)
@@ -968,6 +1152,7 @@ def issue_certificate(
         },
         "evaluation": evaluation,
         "readings": [reading_to_dict(r) for r in reading_rows],
+        "fault_periods": [fault_period_to_dict(r) for r in fault_rows],
     }
 
     cur = conn.execute(

@@ -120,6 +120,103 @@ class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
 
+# ------------------------------------------------------------ 仪器故障时段
+
+class FaultPeriodSubmit(BaseModel):
+    """馆员确认仪器失准：按窗口登记一个带标识的故障时段。
+
+    - fault_id 为窗口内故障时段标识；start_at/end_at 必须带时区，构成
+      半开区间 [start_at, end_at)，起点严格早于终点，且须完全落在窗口
+      [window_start, window_end] 内（两端含：允许恰为窗口边界）；
+    - reason 非空（不能只含空白）；
+    - 同标识同内容（起、止、原因完全一致）重放 -> 幂等；同标识异内容
+      -> 409；已撤回标识再次登记 -> 409；窗口不存在 -> 404；
+    - 非法时段（缺时区、起点不早于终点、超出窗口）或空原因 -> 422，
+      拒收且不改状态。
+    """
+
+    fault_id: str = Field(..., min_length=1, max_length=100,
+                          description="故障时段标识（窗口内唯一，非空白）")
+    start_at: datetime = Field(..., description="故障时段起点（含），带时区")
+    end_at: datetime = Field(..., description="故障时段终点（不含；半开），带时区")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="登记原因（非空，不能只含空白字符）")
+
+    @field_validator("fault_id")
+    @classmethod
+    def _id_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("故障时段标识不能为空（不能只含空白字符）")
+        return v
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _tz_aware(cls, v: datetime) -> datetime:
+        return _require_aware(v)
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("登记原因不能为空（不能只含空白字符）")
+        return v
+
+
+class FaultWithdrawSubmit(BaseModel):
+    """撤回一个已登记的仪器故障时段：凭非空撤回原因（标识在路径中给出）。
+
+    - 重复撤回且原因与已存撤回原因相同 -> 幂等（返回原撤回记录，撤回
+      时间不变）；已撤回但原因不同 -> 409；
+    - 标识在该窗口从未登记（未知标识）-> 404；
+    - 原因为空或只含空白 -> 422。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="撤回原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("撤回原因不能为空（不能只含空白字符）")
+        return v
+
+
+class FaultWithdrawalOut(BaseModel):
+    """撤回信息：故障时段未撤回时为 null。"""
+
+    reason: str = Field(..., description="撤回原因")
+    withdrawn_at: str = Field(..., description="撤回操作时间（UTC）")
+
+
+class FaultPeriodOut(BaseModel):
+    """一条仪器故障时段登记（含撤回状态）。"""
+
+    fault_id: str
+    start_at: str = Field(..., description="半开区间起点（含，UTC）")
+    end_at: str = Field(..., description="半开区间终点（不含，UTC）")
+    duration_seconds: float = Field(..., description="时段时长（秒）")
+    reason: str = Field(..., description="登记原因")
+    status: str = Field(..., description="active | withdrawn")
+    created_at: str = Field(..., description="登记时间（UTC）")
+    withdrawal: Optional[FaultWithdrawalOut] = Field(
+        None, description="撤回信息（原因与撤回时间）；未撤回为 null")
+
+
+class FaultPeriodResponse(BaseModel):
+    effect: str = Field(..., description="registered | idempotent")
+    fault_period: FaultPeriodOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="按有效故障时段遮蔽后立即重算的审定结果")
+
+
+class FaultWithdrawResponse(BaseModel):
+    effect: str = Field(..., description="withdrawn | idempotent")
+    fault_period: FaultPeriodOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="撤回后按剩余有效故障时段立即重算的审定结果")
+
+
 # ------------------------------------------------------------ 证书撤销
 
 class CertificateRevokeSubmit(BaseModel):
@@ -230,6 +327,14 @@ class SegmentOut(BaseModel):
     duration_seconds: float
 
 
+class FaultIntervalOut(BaseModel):
+    """参与审定遮蔽的有效故障时段并集中的一个半开区间。"""
+
+    start: str
+    end: str
+    duration_seconds: float
+
+
 class EvaluationOut(BaseModel):
     verdict: str
     normal_segments: list[SegmentOut]
@@ -240,6 +345,10 @@ class EvaluationOut(BaseModel):
     has_exceeded: bool
     has_unknown: bool
     reading_count: int
+    fault_periods: list[FaultIntervalOut] = Field(
+        default_factory=list,
+        description="有效故障时段取并集（裁剪到窗口内、相接重叠已合并）后参与"
+                    "遮蔽的半开区间；被遮蔽部分无论有无读数均为未知。无故障为空列表")
 
 
 class ReadingOut(BaseModel):
@@ -275,6 +384,8 @@ class WindowOut(BaseModel):
     current_verdict: Optional[str] = Field(None, description="当前可用证书结论；无则为 null")
     current_certificate: Optional["CertificateOut"] = Field(
         None, description="窗口详情中给出的当前可用证书完整内容（列表端点不返回）；无则为 null")
+    active_fault_periods: Optional[list[FaultPeriodOut]] = Field(
+        None, description="窗口详情中给出当前有效（未撤回）仪器故障时段（按起点升序）；列表端点不返回")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -385,6 +496,33 @@ class ReportReadingsDiff(BaseModel):
     changed_count: int
 
 
+# ------------------------------------------------------------ 报告：仪器故障时段
+
+class ReportFaultPeriod(BaseModel):
+    fault_id: str
+    start_at: str
+    end_at: str
+    reason: str
+
+
+class ReportFaultPeriodChange(BaseModel):
+    fault_id: str
+    before: ReportFaultPeriod
+    after: ReportFaultPeriod
+    changed_fields: list[str] = Field(..., description="start_at | end_at | reason")
+
+
+class ReportFaultPeriodsDiff(BaseModel):
+    """两证快照有效仪器故障时段差异（旧快照缺 fault_periods 字段视为空）。"""
+
+    added: list[ReportFaultPeriod]
+    removed: list[ReportFaultPeriod]
+    changed: list[ReportFaultPeriodChange]
+    added_count: int
+    removed_count: int
+    changed_count: int
+
+
 class ReportTimelineSide(BaseModel):
     status: str
     # 键随状态而定：已知区段 {"reading_id","revision"}；
@@ -463,6 +601,9 @@ class RevisionReportOut(BaseModel):
     new_certificate: ReportCertificateRef
     rules_diff: ReportRulesDiff
     readings_diff: ReportReadingsDiff
+    fault_periods_diff: ReportFaultPeriodsDiff = Field(
+        ..., description="两证快照有效仪器故障时段差异（新增/变更/撤回移除）；"
+                         "故障遮蔽部分在 timeline.changes 中呈现为 unknown 变化")
     timeline: ReportTimeline
     summary: ReportSummary
 
